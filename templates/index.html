@@ -105,7 +105,7 @@
     <button class="btn btn-sm btn-outline-info" onclick="loadHistoryJobs()"><i class="bi bi-arrow-clockwise me-1"></i>刷新</button>
     <span class="small text-muted" id="historyCount"></span>
    </div>
-   <div class="table-responsive" style="max-height:calc(100vh - 280px);overflow:auto">
+   <div class="table-responsive">
     <table class="table table-sm table-hover">
      <thead><tr>
       <th>ID</th><th>名称</th><th>用户</th><th>状态</th><th>分区</th><th>节点</th><th>CPU</th><th>运行时间</th><th>结束时间</th><th>操作</th>
@@ -129,7 +129,7 @@
       <button class="btn btn-sm btn-outline-light" id="btnViewMode" onclick="toggleFileViewMode()"><i class="bi bi-layout-split"></i> 分栏</button>
       <button class="btn btn-sm btn-outline-warning" id="btnBookmarks" onclick="toggleBookmarkView()" title="收藏夹"><i class="bi bi-star"></i> 收藏</button>
      </div>
-     <div class="table-responsive" style="max-height:calc(100vh - 280px);overflow:auto">
+     <div class="table-responsive">
       <table class="table table-sm table-hover">
        <thead><tr>
         <th class="sortable" onclick="sortFiles('name')">名称 <i class="bi bi-chevron-expand"></i></th>
