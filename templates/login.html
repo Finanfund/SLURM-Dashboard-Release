@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 — {{ cluster_name }}</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      min-height: 100vh;
+      background: #0d1117;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: "SF Pro Display", "Segoe UI", system-ui, sans-serif;
+      color: #e6edf3;
+    }
+
+    .bg-glow {
+      position: fixed; inset: 0; pointer-events: none; z-index: 0;
+      background: radial-gradient(ellipse 80% 60% at 50% 0%, rgba(56,139,253,.15) 0%, transparent 70%);
+    }
+
+    .card {
+      position: relative; z-index: 1;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 16px;
+      padding: 48px 40px 40px;
+      width: 100%;
+      max-width: 380px;
+      box-shadow: 0 16px 48px rgba(0,0,0,.5);
+    }
+
+    .logo {
+      text-align: center;
+      margin-bottom: 28px;
+    }
+    .logo svg {
+      width: 52px; height: 52px;
+      filter: drop-shadow(0 0 12px rgba(56,139,253,.5));
+    }
+
+    h1 {
+      text-align: center;
+      font-size: 1.35rem;
+      font-weight: 600;
+      color: #e6edf3;
+      margin-bottom: 4px;
+    }
+    .subtitle {
+      text-align: center;
+      font-size: .82rem;
+      color: #8b949e;
+      margin-bottom: 32px;
+    }
+
+    label {
+      display: block;
+      font-size: .82rem;
+      font-weight: 500;
+      color: #8b949e;
+      margin-bottom: 6px;
+      letter-spacing: .5px;
+    }
+
+    .input-wrap {
+      position: relative;
+      margin-bottom: 20px;
+    }
+    .input-wrap svg {
+      position: absolute; left: 12px; top: 50%; transform: translateY(-50%);
+      color: #484f58; width: 18px; height: 18px; pointer-events: none;
+    }
+    input[type="password"] {
+      width: 100%;
+      padding: 10px 12px 10px 40px;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      color: #e6edf3;
+      font-size: .95rem;
+      outline: none;
+      transition: border-color .2s, box-shadow .2s;
+    }
+    input[type="password"]:focus {
+      border-color: #388bfd;
+      box-shadow: 0 0 0 3px rgba(56,139,253,.2);
+    }
+    input[type="password"].error {
+      border-color: #f85149;
+      box-shadow: 0 0 0 3px rgba(248,81,73,.2);
+    }
+
+    .error-msg {
+      display: flex; align-items: center; gap: 6px;
+      background: rgba(248,81,73,.1);
+      border: 1px solid rgba(248,81,73,.3);
+      border-radius: 8px;
+      padding: 10px 14px;
+      margin-bottom: 16px;
+      font-size: .85rem;
+      color: #f85149;
+    }
+    .error-msg svg { flex-shrink: 0; width: 16px; height: 16px; }
+
+    button[type="submit"] {
+      width: 100%;
+      padding: 11px;
+      background: #238636;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: .95rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background .2s, transform .1s;
+      margin-top: 4px;
+    }
+    button[type="submit"]:hover { background: #2ea043; }
+    button[type="submit"]:active { transform: scale(.98); }
+
+    .footer {
+      text-align: center;
+      margin-top: 28px;
+      font-size: .78rem;
+      color: #484f58;
+    }
+  </style>
+</head>
+<body>
+<div class="bg-glow"></div>
+<div class="card">
+  <!-- Logo icon -->
+  <div class="logo">
+    <svg viewBox="0 0 52 52" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="26" cy="26" r="26" fill="#161b22"/>
+      <rect x="10" y="22" width="32" height="20" rx="3" fill="#238636" opacity=".9"/>
+      <rect x="14" y="26" width="8" height="3" rx="1" fill="#acf2bd"/>
+      <rect x="14" y="31" width="16" height="3" rx="1" fill="#acf2bd" opacity=".6"/>
+      <rect x="14" y="36" width="12" height="3" rx="1" fill="#acf2bd" opacity=".4"/>
+      <path d="M18 22v-6a8 8 0 0 1 16 0v6" stroke="#388bfd" stroke-width="2.5" stroke-linecap="round"/>
+      <circle cx="26" cy="16" r="3" fill="#388bfd"/>
+    </svg>
+  </div>
+
+  <h1>访问验证</h1>
+  <p class="subtitle">{{ cluster_name }}</p>
+
+  {% if error %}
+  <div class="error-msg">
+    <svg viewBox="0 0 16 16" fill="currentColor">
+      <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm-.75 4a.75.75 0 0 1 1.5 0v3.5a.75.75 0 0 1-1.5 0V5zm.75 7a1 1 0 1 1 0-2 1 1 0 0 1 0 2z"/>
+    </svg>
+    {{ error }}
+  </div>
+  {% endif %}
+
+  <form method="post" action="/login?next={{ next }}">
+    <label for="password">访问密码</label>
+    <div class="input-wrap">
+      <svg viewBox="0 0 16 16" fill="currentColor">
+        <path d="M4 8V6a4 4 0 0 1 8 0v2h.5A1.5 1.5 0 0 1 14 9.5v4A1.5 1.5 0 0 1 12.5 15h-9A1.5 1.5 0 0 1 2 13.5v-4A1.5 1.5 0 0 1 3.5 8H4zm1.5 0h5V6a2.5 2.5 0 0 0-5 0v2z"/>
+      </svg>
+      <input type="password" id="password" name="password"
+             placeholder="请输入访问密码"
+             autocomplete="current-password"
+             autofocus
+             {% if error %}class="error"{% endif %}>
+    </div>
+    <button type="submit">进入 →</button>
+  </form>
+
+  <div class="footer">SLURM Dashboard &nbsp;·&nbsp; 内网专用</div>
+</div>
+</body>
+</html>
