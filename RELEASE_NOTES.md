@@ -1,5 +1,24 @@
 # SLURM Dashboard Release Notes
 
+## v17 — 低功耗模式 + 性能优化
+
+### 新特性
+- **低功耗模式**：导航栏新增闪电图标切换按钮，一键切换高性能/低功耗模式
+  - 移除所有 `backdrop-filter: blur()` 毛玻璃效果（最大的 GPU 开销来源）
+  - 禁用所有非必要动画和过渡效果
+  - 简化 box-shadow、text-shadow 等发光效果
+  - 替换半透明背景为实色背景（GitHub 暗色主题风格）
+  - 简化渐变进度条/节点柱状条为纯色
+  - 移除 `background-attachment: fixed` 避免滚动重绘
+  - 状态通过 `localStorage` 持久化记忆
+
+### 性能优化（高性能模式也生效）
+- CSS `transition: all` 替换为具体属性列表（避免浏览器检查所有属性）
+- 节点卡片添加 `will-change: transform` 提示 GPU 合成
+- 表单控件、按钮、卡片的 transition 均指定精确属性
+
+---
+
 ## v16.1 — 粘性工具栏布局 + UI 修复
 
 ### 新特性
