@@ -74,7 +74,7 @@ body {
   border: 1px solid var(--border-glow);
   border-radius: 12px;
   box-shadow: 0 4px 24px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.04);
-  transition: all var(--transition-med);
+  transition: border-color var(--transition-med), box-shadow var(--transition-med);
 }
 .card:hover {
   border-color: rgba(100,150,255,0.22);
@@ -114,12 +114,13 @@ body {
   border: 1px solid rgba(100,150,255,0.12);
   border-radius: 12px;
   cursor: pointer;
-  transition: all var(--transition-med);
+  transition: transform var(--transition-med), box-shadow var(--transition-med), border-color var(--transition-med);
   background: rgba(18,18,42,0.75);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   position: relative;
   overflow: hidden;
+  will-change: transform;
 }
 .node-card::before {
   content: '';
@@ -219,7 +220,7 @@ body {
 #dropZone {
   border-color: rgba(100,150,255,0.25) !important;
   background: rgba(20,20,45,0.6);
-  transition: all var(--transition-med);
+  transition: background var(--transition-med), border-color var(--transition-med), box-shadow var(--transition-med);
   border-radius: 12px;
 }
 #dropZone:hover, #dropZone.border-primary {
@@ -270,7 +271,7 @@ body {
 }
 
 /* === Buttons Glow === */
-.btn { transition: all var(--transition-fast); border-radius: 8px; }
+.btn { transition: box-shadow var(--transition-fast), transform var(--transition-fast), color var(--transition-fast), background-color var(--transition-fast), border-color var(--transition-fast); border-radius: 8px; }
 .btn-outline-light:hover, .btn-outline-info:hover,
 .btn-outline-primary:hover, .btn-outline-success:hover,
 .btn-outline-warning:hover {
@@ -312,7 +313,7 @@ body {
   border-color: rgba(100,150,255,0.12) !important;
   color: var(--text-primary) !important;
   border-radius: 8px;
-  transition: all var(--transition-fast);
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
 }
 .form-control:focus, .form-select:focus {
   border-color: var(--accent-cyan) !important;
@@ -372,11 +373,186 @@ tr.table-active, .table-hover tbody tr:active {
   background: rgba(30, 30, 60, 0.6);
   border-color: rgba(100, 150, 255, 0.2);
   color: var(--accent-cyan);
-  transition: all var(--transition-med);
+  transition: background var(--transition-med), border-color var(--transition-med), box-shadow var(--transition-med), transform var(--transition-med);
 }
 .expand-btn-group .btn:hover {
   background: rgba(13, 202, 240, 0.15);
   border-color: var(--accent-cyan);
   box-shadow: 0 0 12px rgba(13, 202, 240, 0.2);
   transform: translateY(-1px);
+}
+
+/* ======================================================================
+   低功耗模式 (Low-Power Mode)
+   body.low-power 激活时覆盖所有 GPU 密集型效果
+   ====================================================================== */
+
+/* --- 移除所有 backdrop-filter（最大的 GPU 开销来源） --- */
+body.low-power,
+body.low-power .card,
+body.low-power .navbar,
+body.low-power .node-card,
+body.low-power .modal-content,
+body.low-power .expand-btn-group .btn,
+body.low-power #editorTextarea {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+/* --- 移除背景渐变和固定背景（触发全页重绘） --- */
+body.low-power {
+  background-image: none !important;
+  background-attachment: scroll !important;
+  background-color: #0d1117 !important;
+}
+
+/* --- 使用实色背景替代半透明玻璃效果 --- */
+body.low-power .card {
+  background: #161b22 !important;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.4) !important;
+  border-color: #30363d !important;
+}
+body.low-power .card:hover {
+  box-shadow: 0 2px 6px rgba(0,0,0,0.5) !important;
+  border-color: #484f58 !important;
+}
+body.low-power .navbar {
+  background: #0d1117 !important;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.5) !important;
+}
+body.low-power .node-card {
+  background: #161b22 !important;
+  will-change: auto !important;
+}
+body.low-power .node-card:hover {
+  transform: none !important;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.5) !important;
+}
+body.low-power .node-card::before { display: none !important; }
+body.low-power .modal-content {
+  background: #161b22 !important;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.6) !important;
+}
+body.low-power #summaryRow .card {
+  background: #161b22 !important;
+}
+body.low-power .expand-btn-group .btn {
+  background: #21262d !important;
+  border-color: #30363d !important;
+}
+body.low-power .expand-btn-group .btn:hover {
+  background: #30363d !important;
+  box-shadow: none !important;
+  transform: none !important;
+}
+body.low-power .partition-card .card-header {
+  background: #21262d !important;
+}
+body.low-power .partition-card .card-header:hover {
+  background: #30363d !important;
+}
+
+/* --- 禁用所有非必要动画和过渡 --- */
+body.low-power *,
+body.low-power *::before,
+body.low-power *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.05s !important;
+}
+
+/* --- 移除所有发光 box-shadow（GPU 合成开销） --- */
+body.low-power .btn-outline-light:hover,
+body.low-power .btn-outline-info:hover,
+body.low-power .btn-outline-primary:hover,
+body.low-power .btn-outline-success:hover,
+body.low-power .btn-outline-warning:hover,
+body.low-power .btn-outline-danger:hover {
+  box-shadow: none !important;
+  transform: none !important;
+}
+
+/* --- 简化进度条（移除渐变和发光） --- */
+body.low-power .progress {
+  box-shadow: none !important;
+  background: #21262d !important;
+}
+body.low-power .progress-bar {
+  background: #388bfd !important;
+  box-shadow: none !important;
+}
+body.low-power .progress-bar.bg-info {
+  background: #39c5cf !important;
+  box-shadow: none !important;
+}
+
+/* --- 简化节点柱状条（移除渐变） --- */
+body.low-power .nc-bar { background: #21262d !important; }
+body.low-power .nc-blue { background: rgba(56,139,253,0.6) !important; }
+body.low-power .nc-red { background: rgba(248,81,73,0.6) !important; }
+body.low-power .nc-cyan { background: rgba(57,197,207,0.5) !important; }
+body.low-power .part-bar-blue { background: rgba(56,139,253,0.5) !important; }
+body.low-power .part-bar-red { background: rgba(248,81,73,0.5) !important; }
+
+/* --- 简化表格 hover --- */
+body.low-power .table-hover tbody tr:hover {
+  background: #21262d !important;
+}
+
+/* --- 简化 tab 样式 --- */
+body.low-power .nav-tabs .nav-link.active {
+  text-shadow: none !important;
+  background: #21262d !important;
+}
+body.low-power .nav-tabs .nav-link:hover {
+  background: #161b22 !important;
+}
+
+/* --- 简化表单控件 --- */
+body.low-power .form-control,
+body.low-power .form-select {
+  background: #0d1117 !important;
+  border-color: #30363d !important;
+}
+body.low-power .form-control:focus,
+body.low-power .form-select:focus {
+  border-color: #388bfd !important;
+  box-shadow: 0 0 0 2px rgba(56,139,253,0.3) !important;
+}
+
+/* --- 简化文本阴影 --- */
+body.low-power .sortable:hover { text-shadow: none !important; }
+body.low-power .nc-bar-text { text-shadow: 0 1px 2px rgba(0,0,0,0.8) !important; }
+body.low-power .part-bar-label { text-shadow: 0 1px 2px rgba(0,0,0,0.8) !important; }
+
+/* --- 简化滚动条 --- */
+body.low-power ::-webkit-scrollbar-track { background: #0d1117 !important; }
+body.low-power ::-webkit-scrollbar-thumb { background: #30363d !important; }
+body.low-power ::-webkit-scrollbar-thumb:hover { background: #484f58 !important; }
+
+/* --- 简化上传区域 --- */
+body.low-power #dropZone {
+  background: #161b22 !important;
+  border-color: #30363d !important;
+}
+body.low-power #dropZone:hover {
+  background: #21262d !important;
+  border-color: #388bfd !important;
+  box-shadow: none !important;
+}
+
+/* --- 简化编辑器 --- */
+body.low-power #editorTextarea {
+  background: #0d1117 !important;
+  border-color: #30363d !important;
+}
+body.low-power #editorTextarea:focus {
+  border-color: #388bfd !important;
+  box-shadow: 0 0 0 2px rgba(56,139,253,0.3) !important;
+}
+
+/* --- 低功耗模式指示器 --- */
+body.low-power #btnPowerMode {
+  color: #3fb950 !important;
+  border-color: #3fb950 !important;
 }

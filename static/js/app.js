@@ -21,8 +21,8 @@ var S = {
     cacheRetainDate: "",
     bookmarks: [],
     bookmarkViewActive: false,
-    historyTrackUsers: "",
-    clusterUsername: "",
+    historyTrackUsers: "zzr",
+    clusterUsername: "zzr",
     _activeLogType: "stdout",
     _historyJobs: [],
     _clusterRendered: false,
@@ -41,7 +41,7 @@ var S = {
     _logAutoFollow: true,
     numaTrackEnabled: false,
     _numaAnalysisLoading: false,
-    _jobMemNumaMode: false
+    _jobMemNumaMode: false  // 跟踪当前内存图表是否为 NUMA 堆叠模式
 };
 
 /* ── Init ── */
@@ -53,7 +53,7 @@ document.addEventListener("DOMContentLoaded", function() {
     document.querySelectorAll("#mainTabs .nav-link").forEach(function(el) {
         el.addEventListener("shown.bs.tab", function(e) {
             S.activeTab = e.target.dataset.tab;
-            if (S.activeTab === "files" && !S.filePath) browsePath("");
+            if (S.activeTab === "files" && !S.filePath) browsePath("/share/home/zzr");
             if (S.activeTab === "jobs") renderJobs();
             if (S.activeTab === "cluster") renderCluster();
             if (S.activeTab === "history") loadHistoryJobs();
@@ -182,9 +182,9 @@ function openSettings() {
     if (el5) el5.value = S.maxCacheMB;
     if (el6) el6.value = S.cacheRetainDate || "";
     var el7 = document.getElementById("settHistoryTrackUsers");
-    if (el7) el7.value = S.historyTrackUsers || "";
+    if (el7) el7.value = S.historyTrackUsers || "zzr";
     var el8 = document.getElementById("settClusterUsername");
-    if (el8) el8.value = S.clusterUsername || "";
+    if (el8) el8.value = S.clusterUsername || "zzr";
     var el9 = document.getElementById("settNumaTrackEnabled");
     if (el9) el9.checked = S.numaTrackEnabled;
     // 灰化逻辑：maxCacheMB > 0 时，日期输入框禁用
@@ -217,8 +217,8 @@ function saveSettings() {
     var fsizes = document.getElementById("settShowFolderSizes").checked;
     var maxMB = parseInt(document.getElementById("settMaxCacheMB").value) || 0;
     var retainDate = document.getElementById("settRetainDate").value || "";
-    var trackUsers = (document.getElementById("settHistoryTrackUsers").value || "").trim();
-    var clusterUser = (document.getElementById("settClusterUsername").value || "").trim();
+    var trackUsers = (document.getElementById("settHistoryTrackUsers").value || "zzr").trim();
+    var clusterUser = (document.getElementById("settClusterUsername").value || "zzr").trim();
     var numaTrack = document.getElementById("settNumaTrackEnabled").checked;
 
     S.historyDuration = mins * 60;
@@ -309,6 +309,26 @@ function setRefresh(v) {
     S.pollTimer = setInterval(function() { if (!S.wsConnected) fetchSnapshot(); }, val * 1000);
 }
 function manualRefresh() { fetchSnapshot(); }
+
+/* ── 低功耗模式切换 ── */
+function togglePowerMode() {
+    var isLow = document.body.classList.toggle("low-power");
+    var btn = document.getElementById("btnPowerMode");
+    if (btn) {
+        btn.title = isLow ? "当前：低功耗模式（点击切换回高性能）" : "切换低功耗模式（减少GPU占用）";
+    }
+    try { localStorage.setItem("powerMode", isLow ? "low" : "high"); } catch(e) {}
+}
+/* 启动时恢复低功耗模式设置 */
+(function() {
+    try {
+        if (localStorage.getItem("powerMode") === "low") {
+            document.body.classList.add("low-power");
+            var btn = document.getElementById("btnPowerMode");
+            if (btn) btn.title = "当前：低功耗模式（点击切换回高性能）";
+        }
+    } catch(e) {}
+})();
 
 /* ── Server Controls ── */
 function togglePause() {
@@ -1249,13 +1269,11 @@ function drawJobCharts(data, numCpus, incremental) {
             });
 
             if (incremental) {
-                // 增量更新：仅更新数据
                 S.charts.jobMem.setOption({
                     xAxis: {data: times},
                     series: [{data: memData}]
                 });
             } else {
-                // 完整绘制
                 S.charts.jobMem.setOption({
                     animation: true, animationDuration: 0, animationDurationUpdate: 300, animationEasingUpdate: "cubicInOut",
                     title: {text: "\u5185\u5b58\u4f7f\u7528", textStyle:{fontSize:12}, left:"center"},
@@ -1549,7 +1567,7 @@ function browseParent() {
     var parts = S.filePath.split("/"); parts.pop();
     browsePath(parts.join("/") || "/");
 }
-function refreshFiles() { browsePath(S.filePath || ""); }
+function refreshFiles() { browsePath(S.filePath || "/share/home/zzr"); }
 function sortFiles(col) {
     if (S.fileSortCol === col) S.fileSortAsc = !S.fileSortAsc;
     else { S.fileSortCol = col; S.fileSortAsc = true; }
