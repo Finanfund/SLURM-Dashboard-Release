@@ -39,7 +39,7 @@
 </nav>
 
 <!-- Summary Cards -->
-<div class="container-fluid mt-1">
+<div class="container-fluid mt-1 main-container">
  <div class="row g-1 mb-1" id="summaryRow">
   <div class="col"><div class="card text-center p-1"><small class="text-muted">节点</small><div class="fw-bold" id="sNodes">-</div></div></div>
   <div class="col"><div class="card text-center p-1"><small class="text-muted">运行</small><div class="fw-bold text-success" id="sRunning">-</div></div></div>
@@ -60,16 +60,16 @@
 
   <!-- Tab: Cluster -->
   <div class="tab-pane fade show active" id="tabCluster">
-   <div class="mb-1 d-flex gap-1 expand-btn-group">
+   <div class="mb-1 d-flex gap-1 expand-btn-group tab-toolbar">
     <button class="btn btn-sm" onclick="expandAll()" title="展开全部"><i class="bi bi-arrows-expand me-1"></i>展开全部</button>
     <button class="btn btn-sm" onclick="collapseAll()" title="收起全部"><i class="bi bi-arrows-collapse me-1"></i>收起全部</button>
    </div>
-   <div id="clusterView"></div>
+   <div id="clusterView" class="tab-scroll-area"></div>
   </div>
 
   <!-- Tab: Jobs -->
   <div class="tab-pane fade" id="tabJobs">
-   <div class="mb-2 d-flex gap-2 align-items-center">
+   <div class="mb-2 d-flex gap-2 align-items-center tab-toolbar">
     <input type="text" class="form-control form-control-sm" placeholder="搜索..." id="jobSearch" oninput="renderJobs()" style="max-width:250px">
     <div class="btn-group btn-group-sm filter-btns">
      <button class="btn btn-outline-light active" onclick="setJobFilter('all',this)">全部</button>
@@ -78,7 +78,7 @@
      <button class="btn btn-outline-secondary" onclick="setJobFilter('COMPLETED',this)">已结束</button>
     </div>
    </div>
-   <div class="table-responsive">
+   <div class="table-responsive tab-scroll-area">
     <table class="table table-sm table-hover">
      <thead><tr>
       <th class="sortable" onclick="sortJobs('job_id')">ID <i class="bi bi-chevron-expand"></i></th>
@@ -100,12 +100,12 @@
 
   <!-- Tab: History -->
   <div class="tab-pane fade" id="tabHistory">
-   <div class="mb-2 d-flex gap-2 align-items-center">
+   <div class="mb-2 d-flex gap-2 align-items-center tab-toolbar">
     <input type="text" class="form-control form-control-sm" placeholder="搜索历史任务..." id="historySearch" oninput="renderHistoryJobs()" style="max-width:250px">
     <button class="btn btn-sm btn-outline-info" onclick="loadHistoryJobs()"><i class="bi bi-arrow-clockwise me-1"></i>刷新</button>
     <span class="small text-muted" id="historyCount"></span>
    </div>
-   <div class="table-responsive">
+   <div class="table-responsive tab-scroll-area">
     <table class="table table-sm table-hover">
      <thead><tr>
       <th>ID</th><th>名称</th><th>用户</th><th>状态</th><th>分区</th><th>节点</th><th>CPU</th><th>运行时间</th><th>结束时间</th><th>操作</th>
@@ -117,9 +117,8 @@
 
   <!-- Tab: Files -->
   <div class="tab-pane fade" id="tabFiles">
-   <div class="row" id="fileRow">
-    <div class="col-12" id="fileBrowserCol">
-     <div class="d-flex gap-1 mb-1 align-items-center flex-wrap">
+   <div class="tab-toolbar">
+    <div class="d-flex gap-1 mb-1 align-items-center flex-wrap">
       <button class="btn btn-sm btn-outline-light" onclick="browseParent()"><i class="bi bi-arrow-up"></i></button>
       <input type="text" class="form-control form-control-sm flex-grow-1" id="pathInput" onkeypress="if(event.key==='Enter')browsePath(this.value)" style="min-width:200px">
       <button class="btn btn-sm btn-outline-info" onclick="refreshFiles()"><i class="bi bi-arrow-clockwise"></i></button>
@@ -128,7 +127,10 @@
       <button class="btn btn-sm btn-outline-secondary" id="btnFolderSizes" onclick="toggleFolderSizes()" title="显示文件夹大小"><i class="bi bi-pie-chart"></i> 大小</button>
       <button class="btn btn-sm btn-outline-light" id="btnViewMode" onclick="toggleFileViewMode()"><i class="bi bi-layout-split"></i> 分栏</button>
       <button class="btn btn-sm btn-outline-warning" id="btnBookmarks" onclick="toggleBookmarkView()" title="收藏夹"><i class="bi bi-star"></i> 收藏</button>
-     </div>
+    </div>
+   </div>
+   <div class="row tab-scroll-area" id="fileRow">
+    <div class="col-12" id="fileBrowserCol">
      <div class="table-responsive">
       <table class="table table-sm table-hover">
        <thead><tr>
