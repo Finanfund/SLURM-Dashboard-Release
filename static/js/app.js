@@ -6,6 +6,7 @@ var S = {
     activeTab: "cluster",
     selectedNode: null,
     jobSortCol: "job_id", jobSortAsc: true, jobFilter: "all",
+    historySortCol: "job_id", historySortAsc: false,
     filePath: "", fileSortCol: "name", fileSortAsc: true,
     editingFile: null, editDirty: false, uploadFiles: [],
     historyDuration: 3600,
@@ -1507,11 +1508,26 @@ function loadHistoryJobs() {
         renderHistoryJobs();
     }).catch(function(e) { console.error("Failed to load history jobs:", e); });
 }
+function sortHistoryJobs(col) {
+    if (S.historySortCol === col) S.historySortAsc = !S.historySortAsc;
+    else { S.historySortCol = col; S.historySortAsc = true; }
+    renderHistoryJobs();
+}
 function renderHistoryJobs() {
     var jobs = S._historyJobs || [];
     var q = (document.getElementById("historySearch") ? document.getElementById("historySearch").value : "").toLowerCase();
     if (q) jobs = jobs.filter(function(j) {
         return j.job_id.indexOf(q) >= 0 || j.name.toLowerCase().indexOf(q) >= 0 || j.user.toLowerCase().indexOf(q) >= 0;
+    });
+    /* 排序 */
+    var col = S.historySortCol, asc = S.historySortAsc;
+    jobs.sort(function(a, b) {
+        var va = a[col], vb = b[col];
+        if (col === "job_id" || col === "num_cpus") {
+            va = parseInt(va) || 0; vb = parseInt(vb) || 0;
+            return asc ? va - vb : vb - va;
+        }
+        return asc ? String(va||"").localeCompare(String(vb||"")) : String(vb||"").localeCompare(String(va||""));
     });
     var countEl = document.getElementById("historyCount");
     if (countEl) countEl.textContent = "共 " + jobs.length + " 条记录";
