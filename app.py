@@ -78,7 +78,11 @@ async def background_collector():
             break
         except Exception as e:
             logger.error(f"Collection schedule error: {e}", exc_info=True)
-        await asyncio.sleep(refresh_interval)
+        # 自适应降频：连续全缓存时临时增大间隔，避免SSH通道饱和
+        effective_interval = refresh_interval
+        if hasattr(collector, '_consecutive_all_cached') and collector._consecutive_all_cached >= 5:
+            effective_interval = max(refresh_interval, 5)
+        await asyncio.sleep(effective_interval)
 
 
 @asynccontextmanager
@@ -268,12 +272,6 @@ async def api_cancel_job(job_id: str):
     result = await collector.cancel_job(job_id)
     return {"status": "ok", "message": result.get("message", "")}
 
-@app.get("/api/job/{job_id}/numa")
-async def api_job_numa(job_id: str):
-    """NUMA 内存分布分析"""
-    result = await collector.get_job_numa_analysis(job_id)
-    return result
-
 @app.get("/api/history-jobs")
 async def api_history_jobs():
     """返回归档的历史任务列表"""
@@ -286,6 +284,13 @@ async def api_job_log(job_id: str, log_type: str = Query(default="stdout"),
     if content is not None:
         return {"job_id": job_id, "log_type": log_type, "content": content}
     return JSONResponse(status_code=404, content={"error": "Job log not found"})
+
+
+@app.get("/api/job/{job_id}/numa")
+async def api_job_numa(job_id: str):
+    """按需获取作业 NUMA 内存分布分析"""
+    result = await collector.get_job_numa_analysis(job_id)
+    return JSONResponse(content=result)
 
 
 # ── File Browser ──

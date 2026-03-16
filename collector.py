@@ -36,6 +36,8 @@ class SSHPool:
         self._conns: Dict[str, 'paramiko.SSHClient'] = {}
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        # 每节点并发限制：防止多个采集周期同时在同一连接上打开过多通道
+        self._node_sems: Dict[str, threading.Semaphore] = {}
 
     def _get_conn(self, node: str) -> Optional['paramiko.SSHClient']:
         """获取或创建到节点的持久连接"""
@@ -65,22 +67,33 @@ class SSHPool:
 
     def exec_cmd(self, node: str, cmd: str, timeout: int = SSH_TIMEOUT) -> Optional[str]:
         """在节点上执行命令（阻塞调用，应在 executor 中使用）"""
-        client = self._get_conn(node)
-        if not client:
+        # 节点级并发限制：每节点最多2个并发命令，防止通道饱和
+        with self._lock:
+            if node not in self._node_sems:
+                self._node_sems[node] = threading.Semaphore(2)
+        sem = self._node_sems[node]
+        if not sem.acquire(timeout=1.0):
+            logger.debug(f"SSH pool: {node} channel busy, skipping")
             return None
         try:
-            _, stdout, stderr = client.exec_command(cmd, timeout=timeout)
-            return stdout.read().decode('utf-8', errors='replace').strip()
-        except Exception as e:
-            logger.debug(f"SSH pool: exec on {node} failed: {e}")
-            # 标记连接为失效
-            with self._lock:
-                self._conns.pop(node, None)
+            client = self._get_conn(node)
+            if not client:
+                return None
             try:
-                client.close()
-            except Exception:
-                pass
-            return None
+                _, stdout, stderr = client.exec_command(cmd, timeout=timeout)
+                return stdout.read().decode('utf-8', errors='replace').strip()
+            except Exception as e:
+                logger.debug(f"SSH pool: exec on {node} failed: {e}")
+                # 标记连接为失效
+                with self._lock:
+                    self._conns.pop(node, None)
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                return None
+        finally:
+            sem.release()
 
     def close_all(self):
         """关闭所有连接"""
@@ -190,6 +203,8 @@ class DataCollector:
         self._job_numa_cache: Dict[str, dict] = {}
         # NUMA 拓扑缓存（每节点只查一次）：{node_name: {nid: cpu_range_str}}
         self._numa_topo_cache: Dict[str, dict] = {}
+        # SSH退化检测：连续全缓存周期计数
+        self._consecutive_all_cached: int = 0
         os.makedirs(CACHE_DIR, exist_ok=True)
         self._load_cache()
         self._load_archived_jobs()
@@ -583,9 +598,9 @@ class DataCollector:
             try:
                 with open("user_settings.json", "r") as f:
                     _us = json.load(f)
-                    track_users = set(u.strip() for u in _us.get("historyTrackUsers", "").split(",") if u.strip())
+                    track_users = set(u.strip() for u in _us.get("historyTrackUsers", "zzr").split(",") if u.strip())
             except Exception:
-                track_users = set()
+                track_users = {"zzr"}
             for jid, ji in self._last_snapshot.jobs.items():
                 if ji.user in track_users and ji.state == "RUNNING" and jid not in self._archived_jobs:
                     d = self._job_to_dict(ji)
@@ -842,6 +857,18 @@ class DataCollector:
         detail = ", ".join(parts)
         logger.info(f"paramiko pool: {len(results)}/{len(node_names)} nodes in {elapsed:.2f}s "
                      f"[{detail}] (active: {_ssh_pool.active_count})")
+
+        # SSH退化检测：连续全缓存时发出警告
+        if fresh_count == 0 and cached_nodes and len(cached_nodes) >= len(node_names):
+            self._consecutive_all_cached += 1
+            if self._consecutive_all_cached >= 5 and self._consecutive_all_cached % 10 == 5:
+                logger.warning(f"SSH degraded: {self._consecutive_all_cached} consecutive all-cached cycles, "
+                               "auto-throttling active. Consider increasing refreshIntervalSec.")
+        else:
+            if self._consecutive_all_cached > 0:
+                logger.info(f"SSH recovered after {self._consecutive_all_cached} all-cached cycles")
+            self._consecutive_all_cached = 0
+
         return results
 
     async def _backfill_slow_nodes(self, pending_tasks, node_futures):
@@ -929,10 +956,10 @@ class DataCollector:
                     if n in nodes:
                         nodes[n].jobs.append(jid)
 
-        # 获取节点实时数据：优先 paramiko 连接池 → 回退 batch SSH → 最终回退逐节点 SSH
-        # ⚠️ 必须查询所有非 down 节点（不只是有运行任务的节点）
-        # 因为 SLURM sinfo 的 free_mem 等于 /proc/meminfo 的 MemFree，不扣除 buffers/caches
-        # 这会导致 idle 节点因 Linux 页缓存显示 90%+ 内存占用（实际可能只有 1-2%）
+        # 获取节点实时数据：SSH 到所有非 down 节点（包括 idle 节点）以获取准确内存数据
+        # 注意：SLURM sinfo 的 free_mem 等于 /proc/meminfo 的 MemFree，不扣除 buffers/caches，
+        # 导致 idle 节点也可能显示很高的"已用"内存（实际大部分是可回收的磁盘缓存）。
+        # 因此必须 SSH 到所有节点，通过 /proc/meminfo 读取 MemFree+Buffers+Cached 来正确计算。
         query_nodes = [n for n in nodes if "down" not in nodes[n].state.lower()]
         rt_results = {}
         if query_nodes:
@@ -973,6 +1000,10 @@ class DataCollector:
                             if saved_job:
                                 jobs[jid].cpu_percent = saved_job.get("cpu_percent", 0)
                                 jobs[jid].mem_used_gb = saved_job.get("mem_used_gb", 0)
+                            else:
+                                # 冷启动兜底：单 job 节点用节点级内存近似
+                                if len(node.jobs) == 1 and node.mem_used_gb > 0:
+                                    jobs[jid].mem_used_gb = node.mem_used_gb
                 else:
                     # ── 新鲜数据：正常 delta 计算 ──
                     cpu_pct = self._compute_node_cpu_pct(node_name, result["cpu_stat"])
@@ -1042,26 +1073,29 @@ class DataCollector:
                             node.mem_total_gb = prev_node.mem_total_gb
                             node.mem_used_gb = prev_node.mem_used_gb
                             node.mem_free_gb = prev_node.mem_free_gb
-                # 同样修复 job CPU
+                # 同样修复 job CPU 和内存
                 for jid, job in jobs.items():
-                    if job.cpu_percent == 0 and job.state == "RUNNING":
+                    if job.state == "RUNNING":
                         prev_job = self._last_snapshot.jobs.get(jid)
-                        if prev_job and prev_job.cpu_percent > 0:
-                            job.cpu_percent = prev_job.cpu_percent
+                        if prev_job:
+                            if job.cpu_percent == 0 and prev_job.cpu_percent > 0:
+                                job.cpu_percent = prev_job.cpu_percent
+                            if job.mem_used_gb == 0 and prev_job.mem_used_gb > 0:
+                                job.mem_used_gb = prev_job.mem_used_gb
 
             # ── 检测最近结束的任务：上一轮存在但本轮消失的 RUNNING 任务 ──
             now = time.time()
             _newly_finished_jids = []
             # 加载追踪用户设置
-            _cluster_user = ""
+            _cluster_user = "zzr"
             try:
                 with open("user_settings.json", "r") as f:
                     _us = json.load(f)
-                    track_users = set(u.strip() for u in _us.get("historyTrackUsers", "").split(",") if u.strip())
+                    track_users = set(u.strip() for u in _us.get("historyTrackUsers", "zzr").split(",") if u.strip())
                     retain_sec = _us.get("historyDurationMin", 60) * 60
-                    _cluster_user = _us.get("clusterUsername", "")
+                    _cluster_user = _us.get("clusterUsername", "zzr")
             except Exception:
-                track_users = set()
+                track_users = {"zzr"}
                 retain_sec = 3600
             if self._last_snapshot:
                 _archive_changed = False
@@ -1351,8 +1385,6 @@ done
                     del self._job_numa_cache[jid]
         except Exception as e:
             logger.warning(f"NUMA 趋势采集失败: {e}")
-        except Exception as e:
-            logger.warning(f"NUMA 趋势采集失败: {e}")
 
     def _expand_nodelist(self, nodelist: str) -> List[str]:
         if not nodelist or nodelist == "(None)":
@@ -1398,7 +1430,7 @@ done
         return {"success": True, "message": f"Cancel signal sent for job {job_id}. {out}".strip()}
 
     async def get_job_numa_analysis(self, job_id: str) -> dict:
-        """按需获取作业 NUMA 内存分布分析（通过 SSH 到计算节点执行 numastat）"""
+        """按需获取作业 NUMA 内存分布分析（通过 SSH 到计算节点读取 cgroup memory.numa_stat）"""
         # 1. 获取作业详情
         details = await self.get_job_details(job_id)
         if not details:
@@ -1411,8 +1443,8 @@ done
         # 取第一个节点（多节点作业只分析第一个）
         node = node_list_str.split(",")[0].strip()
         if "[" in node:
-            import re as _re
-            m = _re.match(r'([a-zA-Z]+)\[(\d+)', node)
+            import re
+            m = re.match(r'([a-zA-Z]+)\[(\d+)', node)
             if m:
                 node = m.group(1) + m.group(2)
 

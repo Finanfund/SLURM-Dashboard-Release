@@ -9,7 +9,7 @@ PORT = int(os.getenv("DASHBOARD_PORT", "8089"))
 
 # Refresh
 DEFAULT_REFRESH_INTERVAL = 10  # seconds
-MIN_REFRESH_INTERVAL = 1
+MIN_REFRESH_INTERVAL = 2  # 1秒在多节点场景下易导致SSH通道饱和
 MAX_REFRESH_INTERVAL = 300
 
 # SSH
@@ -28,7 +28,7 @@ HISTORY_MAX_POINTS = 36000  # ~100 hours at 10s interval
 CLUSTER_NAME = os.getenv("DASHBOARD_CLUSTER_NAME", "SLURM HPC Cluster")
 
 # File browser
-FILE_BROWSER_ROOT = os.getenv("FILE_BROWSER_ROOT", os.path.expanduser("~"))
+FILE_BROWSER_ROOT = "/share/home/zzr"
 
 # Log
 LOG_TAIL_LINES = 200
@@ -54,8 +54,8 @@ DEFAULT_USER_SETTINGS = {
     "maxCacheMB": 100,              # 最大缓存大小 (MB), 0=使用日期限制
     "cacheRetainDate": "",          # 保留自此日期之后的缓存 (当maxCacheMB=0时生效, 格式 YYYY-MM-DD)
     "bookmarks": [],                # 收藏的文件/文件夹路径列表
-    "historyTrackUsers": "",        # 需要追踪历史任务的用户名（逗号分隔），首次使用请填写
-    "clusterUsername": "",            # 本机集群用户名，用于实时采集 stdout/stderr，首次使用请填写
+    "historyTrackUsers": "zzr",     # 需要追踪历史任务的用户名（逗号分隔）
+    "clusterUsername": "zzr",       # 本机集群用户名，用于实时采集 stdout/stderr
     "numaTrackEnabled": False,      # 是否记录 NUMA 内存分布趋势
     "theme": "dark",                # UI theme (reserved)
 }
@@ -82,39 +82,7 @@ def save_user_settings(settings):
         return False
 
 # ── Access Control ──
-_PASSWORD_FILE = os.path.join(SCRIPT_DIR, ".dashboard_password")
-
-def _get_password():
-    """获取访问密码：环境变量 > 密码文件 > 自动生成"""
-    env_pass = os.getenv("DASHBOARD_PASSWORD")
-    if env_pass:
-        return env_pass
-    if os.path.exists(_PASSWORD_FILE):
-        try:
-            with open(_PASSWORD_FILE, "r") as f:
-                saved = f.read().strip()
-            if saved:
-                return saved
-        except Exception:
-            pass
-    # 首次运行时自动生成随机密码
-    import secrets
-    import string
-    new_pass = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(10))
-    try:
-        with open(_PASSWORD_FILE, "w") as f:
-            f.write(new_pass)
-        os.chmod(_PASSWORD_FILE, 0o600)
-    except Exception:
-        pass
-    print(f"\n{'='*55}")
-    print(f"  🔐 首次启动 — 已自动生成访问密码: {new_pass}")
-    print(f"  密码已保存至: {_PASSWORD_FILE}")
-    print(f"  可通过 --password 参数或 DASHBOARD_PASSWORD 环境变量覆盖")
-    print(f"{'='*55}\n")
-    return new_pass
-
-ACCESS_PASSWORD = _get_password()
+ACCESS_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "030709")
 # Derive session secret deterministically from password (no extra storage needed)
 SESSION_SECRET = hashlib.sha256(
     f"slurm-dashboard-v1-{ACCESS_PASSWORD}".encode()
