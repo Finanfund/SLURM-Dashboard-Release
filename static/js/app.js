@@ -22,8 +22,8 @@ var S = {
     cacheRetainDate: "",
     bookmarks: [],
     bookmarkViewActive: false,
-    historyTrackUsers: "zzr",
-    clusterUsername: "zzr",
+    historyTrackUsers: "",
+    clusterUsername: "",
     _activeLogType: "stdout",
     _historyJobs: [],
     _clusterRendered: false,
@@ -54,7 +54,7 @@ document.addEventListener("DOMContentLoaded", function() {
     document.querySelectorAll("#mainTabs .nav-link").forEach(function(el) {
         el.addEventListener("shown.bs.tab", function(e) {
             S.activeTab = e.target.dataset.tab;
-            if (S.activeTab === "files" && !S.filePath) browsePath("/share/home/zzr");
+            if (S.activeTab === "files" && !S.filePath) browsePath("");
             if (S.activeTab === "jobs") renderJobs();
             if (S.activeTab === "cluster") renderCluster();
             if (S.activeTab === "history") loadHistoryJobs();
@@ -183,9 +183,9 @@ function openSettings() {
     if (el5) el5.value = S.maxCacheMB;
     if (el6) el6.value = S.cacheRetainDate || "";
     var el7 = document.getElementById("settHistoryTrackUsers");
-    if (el7) el7.value = S.historyTrackUsers || "zzr";
+    if (el7) el7.value = S.historyTrackUsers || "";
     var el8 = document.getElementById("settClusterUsername");
-    if (el8) el8.value = S.clusterUsername || "zzr";
+    if (el8) el8.value = S.clusterUsername || "";
     var el9 = document.getElementById("settNumaTrackEnabled");
     if (el9) el9.checked = S.numaTrackEnabled;
     // 灰化逻辑：maxCacheMB > 0 时，日期输入框禁用
@@ -218,8 +218,8 @@ function saveSettings() {
     var fsizes = document.getElementById("settShowFolderSizes").checked;
     var maxMB = parseInt(document.getElementById("settMaxCacheMB").value) || 0;
     var retainDate = document.getElementById("settRetainDate").value || "";
-    var trackUsers = (document.getElementById("settHistoryTrackUsers").value || "zzr").trim();
-    var clusterUser = (document.getElementById("settClusterUsername").value || "zzr").trim();
+    var trackUsers = (document.getElementById("settHistoryTrackUsers").value || "").trim();
+    var clusterUser = (document.getElementById("settClusterUsername").value || "").trim();
     var numaTrack = document.getElementById("settNumaTrackEnabled").checked;
 
     S.historyDuration = mins * 60;
@@ -1583,7 +1583,7 @@ function browseParent() {
     var parts = S.filePath.split("/"); parts.pop();
     browsePath(parts.join("/") || "/");
 }
-function refreshFiles() { browsePath(S.filePath || "/share/home/zzr"); }
+function refreshFiles() { browsePath(S.filePath || ""); }
 function sortFiles(col) {
     if (S.fileSortCol === col) S.fileSortAsc = !S.fileSortAsc;
     else { S.fileSortCol = col; S.fileSortAsc = true; }

@@ -5,7 +5,7 @@ import hashlib
 
 # Server
 HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
-PORT = int(os.getenv("DASHBOARD_PORT", "8089"))
+PORT = int(os.getenv("DASHBOARD_PORT", "8000"))
 
 # Refresh
 DEFAULT_REFRESH_INTERVAL = 10  # seconds
@@ -28,7 +28,7 @@ HISTORY_MAX_POINTS = 36000  # ~100 hours at 10s interval
 CLUSTER_NAME = os.getenv("DASHBOARD_CLUSTER_NAME", "SLURM HPC Cluster")
 
 # File browser
-FILE_BROWSER_ROOT = "/share/home/zzr"
+FILE_BROWSER_ROOT = os.path.realpath(os.getenv("FILE_BROWSER_ROOT", os.path.expanduser("~")))
 
 # Log
 LOG_TAIL_LINES = 200
@@ -54,8 +54,8 @@ DEFAULT_USER_SETTINGS = {
     "maxCacheMB": 100,              # 最大缓存大小 (MB), 0=使用日期限制
     "cacheRetainDate": "",          # 保留自此日期之后的缓存 (当maxCacheMB=0时生效, 格式 YYYY-MM-DD)
     "bookmarks": [],                # 收藏的文件/文件夹路径列表
-    "historyTrackUsers": "zzr",     # 需要追踪历史任务的用户名（逗号分隔）
-    "clusterUsername": "zzr",       # 本机集群用户名，用于实时采集 stdout/stderr
+    "historyTrackUsers": "",        # 需要追踪历史任务的用户名（逗号分隔）
+    "clusterUsername": "",          # 本机集群用户名，用于实时采集 stdout/stderr
     "numaTrackEnabled": False,      # 是否记录 NUMA 内存分布趋势
     "theme": "dark",                # UI theme (reserved)
 }
@@ -82,7 +82,7 @@ def save_user_settings(settings):
         return False
 
 # ── Access Control ──
-ACCESS_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "030709")
+ACCESS_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "change-me")
 # Derive session secret deterministically from password (no extra storage needed)
 SESSION_SECRET = hashlib.sha256(
     f"slurm-dashboard-v1-{ACCESS_PASSWORD}".encode()

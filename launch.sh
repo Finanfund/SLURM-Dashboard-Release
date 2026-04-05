@@ -2,9 +2,9 @@
 # ============================================================
 #  SLURM Dashboard — One-Click Launcher
 #  Usage:
-#    bash launch.sh                         # Start on random port (first run will set password)
-#    bash launch.sh 9090                    # Use specific port
-#    bash launch.sh --password mypass       # Set/change password
+#    bash launch.sh                         # Start on default port 8000
+#    bash launch.sh 9090                    # Use custom port
+#    bash launch.sh --password mypass       # Use custom password
 #    bash launch.sh 9090 --password mypass  # Custom port + password
 #    bash launch.sh stop                    # Stop running server
 #    bash launch.sh restart                 # Restart server
@@ -17,10 +17,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PID_FILE="$SCRIPT_DIR/.dashboard.pid"
 LOG_FILE="$SCRIPT_DIR/server.log"
 CACHE_DIR="$SCRIPT_DIR/.cache"
-PASSWORD_FILE="$SCRIPT_DIR/.dashboard_password"
-DEFAULT_PORT=0                            # 0 = auto-generate random port
-CONDA_ENV=""                              # Set your conda env path here, e.g. /home/user/.conda
-CONDA_ACTIVATE=""                         # Set path to 'activate' script, e.g. /opt/miniforge/bin/activate
+DEFAULT_PORT=8000
+DEFAULT_PASSWORD="change-me"
+CONDA_ENV=""
+CONDA_ACTIVATE=""
 
 # ── Colors ──
 RED='\033[0;31m'
@@ -39,24 +39,19 @@ banner() {
 }
 
 activate_conda() {
-    # 0) If python3 already has FastAPI (user pre-activated env), just use it
     if python3 -c "import fastapi" 2>/dev/null; then
         return
     fi
-    # 1) If specific conda env is configured in this script, activate it
     if [[ -n "$CONDA_ENV" && -n "$CONDA_ACTIVATE" && -f "$CONDA_ACTIVATE" ]]; then
         source "$CONDA_ACTIVATE" "$CONDA_ENV"
         return
     fi
-    # 2) If conda is available and has a default env with FastAPI
     if command -v conda &>/dev/null; then
-        # Try activating base first
         conda activate 2>/dev/null || true
         if python3 -c "import fastapi" 2>/dev/null; then
             return
         fi
     fi
-    # 3) Try common conda activate locations
     for activate_path in \
         "$HOME/miniconda3/bin/activate" \
         "$HOME/anaconda3/bin/activate" \
@@ -92,60 +87,6 @@ is_running() {
     return 1
 }
 
-generate_random_port() {
-    # Generate a random port between 10000-60000, avoiding conflicts
-    local port
-    for _ in {1..20}; do
-        port=$(( (RANDOM % 50000) + 10000 ))
-        if ! ss -tlnp 2>/dev/null | grep -q ":$port "; then
-            echo "$port"
-            return
-        fi
-    done
-    echo "$port"  # fallback
-}
-
-get_or_set_password() {
-    # Priority: --password arg > env var > saved file > first-run prompt
-    if [[ -n "${CUSTOM_PASSWORD:-}" ]]; then
-        DASHBOARD_PASSWORD="$CUSTOM_PASSWORD"
-        echo "$DASHBOARD_PASSWORD" > "$PASSWORD_FILE"
-        chmod 600 "$PASSWORD_FILE" 2>/dev/null || true
-        return
-    fi
-    if [[ -n "${DASHBOARD_PASSWORD:-}" ]]; then
-        return
-    fi
-    if [[ -f "$PASSWORD_FILE" ]]; then
-        DASHBOARD_PASSWORD=$(cat "$PASSWORD_FILE")
-        return
-    fi
-    # First run — prompt user to set password
-    echo ""
-    echo -e "  ${CYAN}${BOLD}🔐 首次启动 — 请设置访问密码${NC}"
-    echo -e "  ${YELLOW}(此密码用于登录 Dashboard 网页界面)${NC}"
-    echo ""
-    while true; do
-        read -sp "  请输入密码: " DASHBOARD_PASSWORD
-        echo ""
-        if [[ -z "$DASHBOARD_PASSWORD" ]]; then
-            echo -e "  ${RED}密码不能为空，请重新输入${NC}"
-            continue
-        fi
-        read -sp "  确认密码: " confirm_pass
-        echo ""
-        if [[ "$DASHBOARD_PASSWORD" != "$confirm_pass" ]]; then
-            echo -e "  ${RED}两次输入不一致，请重新输入${NC}"
-            continue
-        fi
-        break
-    done
-    echo "$DASHBOARD_PASSWORD" > "$PASSWORD_FILE"
-    chmod 600 "$PASSWORD_FILE" 2>/dev/null || true
-    echo -e "  ${GREEN}✓ 密码已保存${NC}"
-    echo ""
-}
-
 get_hostname() {
     hostname 2>/dev/null || echo "localhost"
 }
@@ -175,15 +116,7 @@ wait_for_server() {
 
 do_start() {
     local port=${1:-$DEFAULT_PORT}
-
-    # Auto-generate random port if not specified (DEFAULT_PORT=0)
-    if [[ "$port" -eq 0 ]]; then
-        port=$(generate_random_port)
-    fi
-
-    # Get or set password (first-run prompt if needed)
-    get_or_set_password
-    local password="$DASHBOARD_PASSWORD"
+    local password="${DASHBOARD_PASSWORD:-$DEFAULT_PASSWORD}"
 
     # Check if already running
     local pid
@@ -248,7 +181,7 @@ do_start() {
 
 print_access_info() {
     local port=$1
-    local password="${2:-${DASHBOARD_PASSWORD:-}}"
+    local password="${2:-$DEFAULT_PASSWORD}"
     local hn
     hn=$(get_hostname)
     local ip
@@ -384,21 +317,21 @@ case "${1:-start}" in
         echo "  Usage: bash launch.sh [start|stop|restart|status|<port>] [--password <pass>]"
         echo ""
         echo "  Commands:"
-        echo "    start [port]    Start dashboard (random port if not specified)"
+        echo "    start [port]    Start dashboard (default port: $DEFAULT_PORT)"
         echo "    stop            Stop running dashboard"
         echo "    restart [port]  Restart dashboard"
         echo "    status          Check if dashboard is running"
         echo "    <port>          Start on specified port"
         echo ""
         echo "  Options:"
-        echo "    --password, -p <pass>   Set access password (first run will prompt if not set)"
+        echo "    --password, -p <pass>   Set access password (default: $DEFAULT_PASSWORD)"
         echo "                            Can also set via env: DASHBOARD_PASSWORD=xxx bash launch.sh"
         echo ""
         echo "  Examples:"
-        echo "    bash launch.sh                           # random port, first run prompts for password"
-        echo "    bash launch.sh 9090                      # specific port"
-        echo "    bash launch.sh --password secret         # set password"
-        echo "    bash launch.sh 9090 --password secret    # specific port + password"
+        echo "    bash launch.sh                           # port=$DEFAULT_PORT, password=$DEFAULT_PASSWORD"
+        echo "    bash launch.sh 9090                      # port=9090"
+        echo "    bash launch.sh --password secret         # custom password"
+        echo "    bash launch.sh 9090 --password secret    # custom port + password"
         echo "    DASHBOARD_PASSWORD=secret bash launch.sh # via environment variable"
         echo ""
         ;;

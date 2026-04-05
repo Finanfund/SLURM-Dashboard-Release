@@ -195,13 +195,13 @@ bash launch.sh status                  # 查看状态
 tail -f server.log
 
 # 也可以前台运行（调试用）
-python start.py --fg --port 8089
+python start.py --fg --port 8000
 ```
 
 **环境变量**（可选）：
 
 ```bash
-export DASHBOARD_PORT=8089           # 端口号
+export DASHBOARD_PORT=8000           # 端口号
 export DASHBOARD_PASSWORD=mypass     # 访问密码
 export DASHBOARD_HOST=0.0.0.0       # 监听地址
 export DASHBOARD_CLUSTER_NAME="My Cluster"  # 集群名称
@@ -290,7 +290,7 @@ slurm-dashboard/
 ### Q: 访问不了页面
 
 1. 确认服务已启动：`bash launch.sh status`
-2. 确认 SSH 隧道已建立：`ssh -N -L 8089:localhost:8089 <user>@<cluster>`
+2. 确认 SSH 隧道已建立：`ssh -N -L <port>:localhost:<port> <user>@<cluster>`
 3. 确认端口正确且未被占用
 
 ### Q: 节点数据显示不全

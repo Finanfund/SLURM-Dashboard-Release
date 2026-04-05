@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Any
 from collections import deque
-from config import SSH_OPTIONS, SSH_TIMEOUT, HISTORY_MAX_POINTS, CACHE_DIR, SCRIPT_DIR
+from config import SSH_OPTIONS, SSH_TIMEOUT, HISTORY_MAX_POINTS, CACHE_DIR, SCRIPT_DIR, load_user_settings
 
 logger = logging.getLogger("collector")
 
@@ -596,11 +596,10 @@ class DataCollector:
         # 包含当前正在运行且被追踪的用户的任务
         if self._last_snapshot:
             try:
-                with open("user_settings.json", "r") as f:
-                    _us = json.load(f)
-                    track_users = set(u.strip() for u in _us.get("historyTrackUsers", "zzr").split(",") if u.strip())
+                _us = load_user_settings()
+                track_users = set(u.strip() for u in (_us.get("historyTrackUsers", "") or "").split(",") if u.strip())
             except Exception:
-                track_users = {"zzr"}
+                track_users = set()
             for jid, ji in self._last_snapshot.jobs.items():
                 if ji.user in track_users and ji.state == "RUNNING" and jid not in self._archived_jobs:
                     d = self._job_to_dict(ji)
@@ -1087,15 +1086,14 @@ class DataCollector:
             now = time.time()
             _newly_finished_jids = []
             # 加载追踪用户设置
-            _cluster_user = "zzr"
+            _cluster_user = ""
             try:
-                with open("user_settings.json", "r") as f:
-                    _us = json.load(f)
-                    track_users = set(u.strip() for u in _us.get("historyTrackUsers", "zzr").split(",") if u.strip())
-                    retain_sec = _us.get("historyDurationMin", 60) * 60
-                    _cluster_user = _us.get("clusterUsername", "zzr")
+                _us = load_user_settings()
+                track_users = set(u.strip() for u in (_us.get("historyTrackUsers", "") or "").split(",") if u.strip())
+                retain_sec = _us.get("historyDurationMin", 60) * 60
+                _cluster_user = (_us.get("clusterUsername", "") or "").strip()
             except Exception:
-                track_users = {"zzr"}
+                track_users = set()
                 retain_sec = 3600
             if self._last_snapshot:
                 _archive_changed = False

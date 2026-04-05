@@ -4,3 +4,4 @@ __pycache__/
 server.log
 user_settings.json
 .dashboard.pid
+.dashboard_password
