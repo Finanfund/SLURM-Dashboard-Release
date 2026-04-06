@@ -119,8 +119,7 @@ do_start() {
         pip install itsdangerous -q
     fi
 
-    # Clear cache
-    rm -rf "$CACHE_DIR"
+        # Preserve historical cache and archived jobs across restarts
     mkdir -p "$CACHE_DIR"
 
     # Check port availability

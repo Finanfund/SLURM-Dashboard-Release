@@ -2,7 +2,7 @@
 """
 SLURM Dashboard — Launcher
 Usage:
-    python start.py              # Start in background on default port (8000)
+    python start.py              # Start in background on default port (8089)
     python start.py --port 9090  # Use custom port
     python start.py --fg         # Run in foreground (for debugging)
 """
@@ -20,7 +20,7 @@ CACHE_DIR = os.path.join(SCRIPT_DIR, ".cache")
 
 def find_python():
     """Find the correct Python with FastAPI installed."""
-    for p in [sys.executable, "python3", "python"]:
+    for p in [sys.executable, os.path.expanduser("~/.conda/bin/python"), "python3", "python"]:
         try:
             out = subprocess.check_output([p, "-c", "import fastapi; print('ok')"],
                                           stderr=subprocess.DEVNULL).decode().strip()
@@ -52,7 +52,7 @@ def clear_cache():
 
 def main():
     parser = argparse.ArgumentParser(description="SLURM Dashboard Launcher")
-    parser.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")
+    parser.add_argument("--port", type=int, default=8089, help="Server port (default: 8089)")
     parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
     parser.add_argument("--fg", action="store_true", help="Run in foreground")
     args = parser.parse_args()

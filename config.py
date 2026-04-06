@@ -5,7 +5,7 @@ import hashlib
 
 # Server
 HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
-PORT = int(os.getenv("DASHBOARD_PORT", "8000"))
+PORT = int(os.getenv("DASHBOARD_PORT", "8089"))
 
 # Refresh
 DEFAULT_REFRESH_INTERVAL = 10  # seconds
@@ -57,6 +57,7 @@ DEFAULT_USER_SETTINGS = {
     "historyTrackUsers": "",        # 需要追踪历史任务的用户名（逗号分隔）
     "clusterUsername": "",          # 本机集群用户名，用于实时采集 stdout/stderr
     "numaTrackEnabled": False,      # 是否记录 NUMA 内存分布趋势
+    "nodeVisibility": {},            # 节点显示/记录设置 {nodeName: {"show": true, "record": true}}
     "theme": "dark",                # UI theme (reserved)
 }
 

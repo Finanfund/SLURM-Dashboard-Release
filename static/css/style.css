@@ -508,6 +508,64 @@ body.low-power .nav-tabs .nav-link:hover {
   background: #161b22 !important;
 }
 
+/* === File Browser Split Layout === */
+#fileRow {
+  gap: 0;
+  overflow: hidden;
+}
+#fileBrowserCol {
+  overflow-y: auto;
+  flex: 1;
+}
+#fileEditorCol {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+#editorTextarea {
+  flex: 1;
+  min-height: 0;
+}
+.file-splitter {
+  width: 6px;
+  cursor: col-resize;
+  background: rgba(100, 150, 255, 0.15);
+  transition: background var(--transition-fast);
+  flex-shrink: 0;
+  position: relative;
+  z-index: 10;
+}
+.file-splitter:hover,
+.file-splitter:active {
+  background: var(--accent-cyan);
+}
+.file-splitter::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 2px;
+  height: 40px;
+  background: rgba(255,255,255,0.3);
+  border-radius: 2px;
+}
+
+/* === Navbar collect time badge === */
+#sCollect {
+  font-size: 10px !important;
+  padding: 2px 6px;
+}
+
+/* === Node visibility table in settings === */
+#nodeVisibilityTable {
+  font-size: 12px;
+}
+#nodeVisibilityTable .form-check-input {
+  width: 16px;
+  height: 16px;
+}
+
 /* --- 简化表单控件 --- */
 body.low-power .form-control,
 body.low-power .form-select {

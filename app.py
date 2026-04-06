@@ -73,7 +73,9 @@ async def background_collector():
     while True:
         try:
             if not collector.paused:
-                asyncio.create_task(collect_and_broadcast())
+                # 反压机制：semaphore无空闲槽时跳过本轮，避免任务堆积
+                if _collect_semaphore._value > 0:
+                    asyncio.create_task(collect_and_broadcast())
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -88,7 +90,7 @@ async def background_collector():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bg_task, _collect_semaphore
-    _collect_semaphore = asyncio.Semaphore(3)  # 在事件循环内创建
+    _collect_semaphore = asyncio.Semaphore(1)  # 串行采集，避免并发SSH竞争
     logger.info(f"Starting SLURM Dashboard on {config.HOST}:{config.PORT}")
     bg_task = asyncio.create_task(background_collector())
     yield
@@ -531,6 +533,13 @@ async def api_clear_cache():
 async def api_cache_stats():
     """获取缓存统计信息"""
     return collector.get_cache_stats()
+
+
+@app.get("/api/disk-info")
+async def api_disk_info(path: str = Query(default="")):
+    """获取指定路径所在分区的磁盘空间信息"""
+    result = await collector.get_disk_info(path or config.FILE_BROWSER_ROOT)
+    return JSONResponse(content=result)
 
 
 # ── 登录节点管理 ──

@@ -130,8 +130,8 @@
 ### 1. 获取代码
 
 ```bash
-git clone https://github.com/Finanfund/SLURM-Dashboard-Release.git
-cd SLURM-Dashboard-Release
+git clone <your-repo-url>
+cd <your-project-directory>
 ```
 
 ### 2. 安装依赖

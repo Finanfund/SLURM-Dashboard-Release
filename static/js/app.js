@@ -44,7 +44,10 @@ var S = {
     _logAutoFollow: true,
     numaTrackEnabled: false,
     _numaAnalysisLoading: false,
-    _jobMemNumaMode: false  // 跟踪当前内存图表是否为 NUMA 堆叠模式
+    _jobMemNumaMode: false,  // 跟踪当前内存图表是否为 NUMA 堆叠模式
+    _nodeVisibility: {},     // 节点显示/记录设置
+    _splitterDragging: false,
+    _hasCopied: false        // 是否有复制内容
 };
 
 /* ── Init ── */
@@ -56,7 +59,10 @@ document.addEventListener("DOMContentLoaded", function() {
     document.querySelectorAll("#mainTabs .nav-link").forEach(function(el) {
         el.addEventListener("shown.bs.tab", function(e) {
             S.activeTab = e.target.dataset.tab;
-            if (S.activeTab === "files" && !S.filePath) browsePath("");
+            if (S.activeTab === "files") {
+                if (!S.filePath) browsePath("");
+                loadDiskInfo();
+            }
             if (S.activeTab === "jobs") renderJobs();
             if (S.activeTab === "cluster") renderCluster();
             if (S.activeTab === "history") loadHistoryJobs();
@@ -115,6 +121,7 @@ function loadSettingsFromServer() {
         if (s.historyTrackUsers) S.historyTrackUsers = s.historyTrackUsers;
         if (s.clusterUsername) S.clusterUsername = s.clusterUsername;
         if (typeof s.numaTrackEnabled === "boolean") S.numaTrackEnabled = s.numaTrackEnabled;
+        if (s.nodeVisibility && typeof s.nodeVisibility === "object") S._nodeVisibility = s.nodeVisibility;
     }).catch(function() {});
 }
 
@@ -201,6 +208,8 @@ function openSettings() {
     // 灰化逻辑：maxCacheMB > 0 时，日期输入框禁用
     updateRetainDateState();
     if (el5) el5.addEventListener("input", updateRetainDateState);
+    // 加载节点可见性表格
+    loadNodeVisibilityTable();
     // 加载缓存统计
     loadCacheStats();
     new bootstrap.Modal(document.getElementById("settingsModal")).show();
@@ -242,6 +251,17 @@ function saveSettings() {
     S.clusterUsername = clusterUser;
     S.numaTrackEnabled = numaTrack;
 
+    // 收集节点可见性设置（表格未加载时保留已有设置）
+    var nv = collectNodeVisibility();
+    if (Object.keys(nv).length === 0 && Object.keys(S._nodeVisibility || {}).length > 0) {
+        nv = S._nodeVisibility;
+    }
+    S._nodeVisibility = nv;
+
+    // 强制集群视图重建（节点可见性可能变了）
+    S._clusterRendered = false;
+    S._lastPartKey = "";
+
     // Update navbar inputs
     document.getElementById("inputHistoryMin").value = mins;
     document.getElementById("inputRefreshSec").value = secs;
@@ -256,7 +276,8 @@ function saveSettings() {
         cacheRetainDate: retainDate,
         historyTrackUsers: trackUsers,
         clusterUsername: clusterUser,
-        numaTrackEnabled: numaTrack
+        numaTrackEnabled: numaTrack,
+        nodeVisibility: nv
     });
 
     // Reload chart with new durations
@@ -266,6 +287,69 @@ function saveSettings() {
 
     // Brief visual feedback
     showToast("设置已保存");
+}
+
+/* 节点可见性表格 */
+function loadNodeVisibilityTable() {
+    var tbody = document.getElementById("nodeVisibilityBody");
+    if (!tbody) return;
+    // 始终从 snapshot 获取完整（未过滤）的分区节点列表
+    fetch("/api/snapshot").then(function(r) { return r.json(); }).then(function(d) {
+        if (d && d.all_partitions) {
+            _buildNodeVisTable(d.all_partitions, [], tbody);
+        } else if (d && d.partitions) {
+            _buildNodeVisTable(d.partitions, d.nodes || [], tbody);
+        }
+    }).catch(function() {});
+}
+
+function _buildNodeVisTable(partitions, nodes, tbody) {
+    // 构建节点->分区映射（从 sinfo 数据，而非过滤后的数据）
+    var allNodes = {};
+    partitions.forEach(function(p) {
+        (p.node_list || []).forEach(function(n) {
+            if (!allNodes[n]) allNodes[n] = [];
+            allNodes[n].push(p.name);
+        });
+    });
+    // 也从 nodes 列表补充
+    nodes.forEach(function(n) {
+        if (!allNodes[n.name]) allNodes[n.name] = [n.partitions || ""];
+    });
+    var sortedNames = Object.keys(allNodes).sort();
+    if (sortedNames.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" class="text-muted text-center">暂无节点数据</td></tr>';
+        return;
+    }
+    var nv = S._nodeVisibility || {};
+    var html = "";
+    sortedNames.forEach(function(name) {
+        var vis = nv[name] || {};
+        var show = vis.show !== false;
+        var record = vis.record !== false;
+        var parts = allNodes[name].join(",");
+        html += '<tr>';
+        html += '<td class="small">' + esc(name) + '</td>';
+        html += '<td class="small text-muted">' + esc(parts) + '</td>';
+        html += '<td><input type="checkbox" class="form-check-input nv-show" data-node="' + esc(name) + '"' + (show ? ' checked' : '') + '></td>';
+        html += '<td><input type="checkbox" class="form-check-input nv-record" data-node="' + esc(name) + '"' + (record ? ' checked' : '') + '></td>';
+        html += '</tr>';
+    });
+    tbody.innerHTML = html;
+}
+
+function collectNodeVisibility() {
+    var nv = {};
+    var rows = document.querySelectorAll("#nodeVisibilityBody tr");
+    rows.forEach(function(row) {
+        var showCb = row.querySelector(".nv-show");
+        var recCb = row.querySelector(".nv-record");
+        if (showCb && recCb) {
+            var name = showCb.dataset.node;
+            nv[name] = { show: showCb.checked, record: recCb.checked };
+        }
+    });
+    return nv;
 }
 
 function showToast(msg) {
@@ -386,12 +470,27 @@ function updateUI() {
 }
 function updateSummary() {
     var s = S.data.summary; if (!s) return;
-    setText("sNodes", s.total_nodes); setText("sRunning", s.running_jobs); setText("sPending", s.pending_jobs);
     var cpuPct = s.total_cpus > 0 ? Math.round(s.alloc_cpus / s.total_cpus * 100) : 0;
     var memPct = s.total_mem_gb > 0 ? Math.round(s.used_mem_gb / s.total_mem_gb * 100) : 0;
     setBar("sCpuBar", cpuPct, s.alloc_cpus + "/" + s.total_cpus + " (" + cpuPct + "%)");
     setBar("sMemBar", memPct, s.used_mem_gb.toFixed(0) + "/" + s.total_mem_gb.toFixed(0) + "G (" + memPct + "%)");
-    if (S.data._collect_time_ms) setText("sCollect", S.data._collect_time_ms + "ms");
+    if (S.data._collect_time_ms) {
+        var el = document.getElementById("sCollect");
+        if (el) el.textContent = S.data._collect_time_ms + "ms";
+    }
+    /* 更新任务过滤按钮上的计数 */
+    var jobs = S.data.jobs || [];
+    var nRun = 0, nPend = 0, nFin = 0;
+    var finStates = ["COMPLETED","TIMEOUT","CANCELLED","FAILED","PREEMPTED"];
+    jobs.forEach(function(j) {
+        if (j.state === "RUNNING") nRun++;
+        else if (j.state === "PENDING") nPend++;
+        else if (finStates.indexOf(j.state) >= 0) nFin++;
+    });
+    setText("cntAll", jobs.length);
+    setText("cntRunning", nRun);
+    setText("cntPending", nPend);
+    setText("cntFinished", nFin || "");
 }
 function setText(id, v) { var el = document.getElementById(id); if (el) el.textContent = v; }
 function setBar(id, pct, label) {
@@ -402,8 +501,13 @@ function setBar(id, pct, label) {
 /* ── 自动刷新打开的图表（无闪烁，增量追加） ── */
 function autoRefreshCharts() {
     // 增量追加新数据点到节点图表（节点详情面板打开时）
-    if (S.selectedNode && S.activeTab === "cluster" && S._nodeChartData) {
-        try { appendNodeChartPoint(); } catch(e) { console.error("[appendNodeChartPoint]", e); }
+    if (S.selectedNode && S.activeTab === "cluster") {
+        if (S._nodeChartData) {
+            try { appendNodeChartPoint(); } catch(e) { console.error("[appendNodeChartPoint]", e); }
+        } else if (!S._nodeChartLoading) {
+            // 初始 fetch 失败了，自动重试一次
+            try { loadNodeChart(S.selectedNode); } catch(e) { console.error("[retryNodeChart]", e); }
+        }
     }
     // 增量追加新数据点到任务图表（任务模态框打开时）
     var jobModal = document.getElementById("jobModal");
@@ -447,7 +551,7 @@ function appendNodeChartPoint() {
             for (var k = 0; k < S.data.jobs.length; k++) {
                 if (S.data.jobs[k].job_id === jid) { job = S.data.jobs[k]; break; }
             }
-            if (job && job.state === "RUNNING") {
+            if (job && job.state === "RUNNING" && (job.num_nodes || 1) <= 1) {
                 if (!S._nodeChartJobData[jid]) S._nodeChartJobData[jid] = [];
                 S._nodeChartJobData[jid].push({
                     t: t, cpu: job.cpu_percent, mem: job.mem_used_gb, num_cpus: job.num_cpus
@@ -515,6 +619,23 @@ function renderCluster() {
     var parts = d.partitions || [];
     var nodeMap = {}; (d.nodes || []).forEach(function(n) { nodeMap[n.name] = n; });
     var jobMap = {}; (d.jobs || []).forEach(function(j) { jobMap[j.job_id] = j; });
+    // 前端节点可见性过滤（确保 show=false 的节点不显示）
+    var nv = S._nodeVisibility || {};
+    if (Object.keys(nv).length > 0) {
+        var filteredNodeMap = {};
+        Object.keys(nodeMap).forEach(function(name) {
+            if (nv[name] && nv[name].show === false) return;
+            filteredNodeMap[name] = nodeMap[name];
+        });
+        nodeMap = filteredNodeMap;
+        parts = parts.map(function(p) {
+            return Object.assign({}, p, {
+                node_list: (p.node_list || []).filter(function(n) {
+                    return !(nv[n] && nv[n].show === false);
+                })
+            });
+        }).filter(function(p) { return (p.node_list || []).length > 0; });
+    }
     var key = parts.map(function(p) { return p.name + ":" + (p.node_list||[]).join(","); }).join("|");
     if (!S._clusterRendered || key !== S._lastPartKey) {
         buildClusterDOM(parts, nodeMap, jobMap);
@@ -555,7 +676,20 @@ function buildClusterDOM(parts, nodeMap, jobMap) {
         html += '<div class="node-detail-inline d-none" id="nodeDetail_' + p.name + '"></div>';
         html += '</div></div></div>';
     });
-    document.getElementById("clusterView").innerHTML = html;
+    // 保留 summaryRow，只替换分区内容
+    var clusterDiv = document.getElementById("clusterView");
+    var summaryEl = document.getElementById("summaryRow");
+    // 移除旧的分区卡片（保留 summaryRow）
+    var oldCards = clusterDiv.querySelectorAll(".partition-card");
+    oldCards.forEach(function(el) { el.remove(); });
+    var oldDetails = clusterDiv.querySelectorAll(".node-detail-inline");
+    oldDetails.forEach(function(el) { el.remove(); });
+    // 添加新的分区卡片
+    var temp = document.createElement("div");
+    temp.innerHTML = html;
+    while (temp.firstChild) {
+        clusterDiv.appendChild(temp.firstChild);
+    }
     if (S.selectedNode && S.data) {
         var n = null;
         for (var i = 0; i < S.data.nodes.length; i++) {
@@ -597,7 +731,7 @@ function buildNodeCard(n, jobMap) {
         var finishedNames = [];
         Object.keys(jobMap).forEach(function(jid) {
             var fj = jobMap[jid];
-            if (fj.state === "COMPLETED" && fj.nodes && fj.nodes.indexOf(n.name) >= 0) {
+            if (fj.state !== "RUNNING" && fj.state !== "PENDING" && fj.nodes && fj.nodes.indexOf(n.name) >= 0) {
                 finishedNames.push(fj.name.slice(0, 12));
             }
         });
@@ -796,15 +930,26 @@ function loadNodeChart(name) {
     S._nodeChartData = null;
     S._nodeChartJobData = {};
     S._nodeChartSeriesCount = 0;
+    S._nodeChartLoading = true;
     var since = S.historyDuration > 0 ? (Date.now()/1000 - S.historyDuration) : 0;
     fetch("/api/history/node/" + name + "?since=" + since).then(function(r) { return r.json(); }).then(function(d) {
+        S._nodeChartLoading = false;
         var nodeData = d.data || [];
         S._nodeChartData = nodeData; // 缓存历史数据
         if (!S.showJobCurves) { drawNodeChart(nodeData, [], false); return; }
         var node = null;
         if (S.data && S.data.nodes) { for (var i = 0; i < S.data.nodes.length; i++) { if (S.data.nodes[i].name === name) { node = S.data.nodes[i]; break; } } }
         if (!node || !node.jobs || node.jobs.length === 0) { drawNodeChart(nodeData, [], false); return; }
-        var promises = node.jobs.map(function(jid) {
+        // 多节点任务：cpu_percent 是所有节点总和，不适合在单节点堆叠图中展示
+        var singleNodeJobs = node.jobs.filter(function(jid) {
+            if (!S.data || !S.data.jobs) return true;
+            for (var k = 0; k < S.data.jobs.length; k++) {
+                if (S.data.jobs[k].job_id === jid) return (S.data.jobs[k].num_nodes || 1) <= 1;
+            }
+            return true;
+        });
+        if (singleNodeJobs.length === 0) { drawNodeChart(nodeData, [], false); return; }
+        var promises = singleNodeJobs.map(function(jid) {
             return fetch("/api/history/job/" + jid + "?since=" + since)
                 .then(function(r) { return r.json(); })
                 .then(function(dd) {
@@ -814,7 +959,12 @@ function loadNodeChart(name) {
                 .catch(function() { return {jid: jid, data: []}; });
         });
         Promise.all(promises).then(function(jh) { drawNodeChart(nodeData, jh, false); });
-    }).catch(function(e) { console.warn("nodeChart err:", e); });
+    }).catch(function(e) {
+        S._nodeChartLoading = false;
+        S._nodeChartData = []; // 设为空数组（truthy），让后续 WS 增量更新仍能追加数据
+        console.warn("nodeChart err:", e);
+        try { drawNodeChart([], [], false); } catch(e2) {}
+    });
 }
 
 function drawNodeChart(data, jobHistories, incremental) {
@@ -983,15 +1133,17 @@ function renderJobs() {
     });
     var html = "";
     jobs.forEach(function(j) {
-        var stCls = j.state === "RUNNING" ? "success" : j.state === "PENDING" ? "warning" : j.state === "COMPLETED" ? "info" : "secondary";
+        var stCls = j.state === "RUNNING" ? "success" : j.state === "PENDING" ? "warning" : j.state === "COMPLETED" ? "info" : j.state === "TIMEOUT" ? "warning" : j.state === "CANCELLED" || j.state === "FAILED" ? "danger" : "secondary";
         var stLabel = j.state;
-        /* 已结束任务：显示"已结束 @HH:MM:SS"徽章 */
-        if (j.state === "COMPLETED" && j.end_time) {
-            stLabel = "结束@" + j.end_time;
+        /* 已结束任务：显示状态@HH:MM:SS徽章 */
+        var _fJobStates = ["COMPLETED", "TIMEOUT", "CANCELLED", "FAILED", "PREEMPTED"];
+        if (_fJobStates.indexOf(j.state) >= 0 && j.end_time) {
+            var _sMap = {"COMPLETED": "结束", "TIMEOUT": "超时", "CANCELLED": "取消", "FAILED": "失败", "PREEMPTED": "抢占"};
+            stLabel = (_sMap[j.state] || j.state) + "@" + j.end_time;
         }
         var cpuNorm = j.num_cpus > 0 ? (j.cpu_percent / j.num_cpus * 100).toFixed(1) : j.cpu_percent.toFixed(1);
         var nameShort = j.name.length > 25 ? j.name.slice(0, 25) + "..." : j.name;
-        var rowStyle = j.state === "COMPLETED" ? 'style="cursor:pointer;opacity:0.65"' : 'style="cursor:pointer"';
+        var rowStyle = (j.state !== "RUNNING" && j.state !== "PENDING") ? 'style="cursor:pointer;opacity:0.65"' : 'style="cursor:pointer"';
         html += '<tr onclick="openJobDetail(\'' + j.job_id + '\')" ' + rowStyle + '>';
         html += '<td>' + j.job_id + '</td>';
         html += '<td title="' + escAttr(j.name) + '">' + esc(nameShort) + '</td>';
@@ -1003,7 +1155,7 @@ function renderJobs() {
         html += '<td>' + cpuNorm + '%</td>';
         html += '<td>' + j.mem_used_gb.toFixed(1) + 'G</td>';
         html += '<td>' + j.time_used + '</td>';
-        if (j.state === "COMPLETED") {
+        if (j.state !== "RUNNING" && j.state !== "PENDING") {
             html += '<td><span class="text-muted small">已结束</span></td>';
         } else {
             html += '<td><button class="btn btn-sm btn-outline-danger py-0" onclick="event.stopPropagation();cancelJobDirect(\'' + j.job_id + '\')"><i class="bi bi-x-lg"></i></button></td>';
@@ -1050,7 +1202,8 @@ function openJobDetail(jid) {
     if (!j && S._historyJobs) {
         for (var i = 0; i < S._historyJobs.length; i++) { if (S._historyJobs[i].job_id === jid) { j = S._historyJobs[i]; break; } }
     }
-    if (j && j.state === "COMPLETED") S._jobIsFinished = true;
+    var _finishedStates = ["COMPLETED", "TIMEOUT", "CANCELLED", "FAILED", "PREEMPTED"];
+    if (j && _finishedStates.indexOf(j.state) >= 0) S._jobIsFinished = true;
     /* 已结束任务默认开启全程历史 */
     if (S._jobIsFinished) {
         S._jobFullHistory = true;
@@ -1060,8 +1213,12 @@ function openJobDetail(jid) {
     document.getElementById("jobModalTitle").textContent = "任务 " + jid + (j ? " — " + j.name : "");
     if (j) {
         var stateDisplay = j.state;
-        if (j.state === "COMPLETED" && j.end_time) stateDisplay = '<span class="badge bg-info">已结束@' + j.end_time + '</span>';
-        else stateDisplay = j.state;
+        var _fStates = ["COMPLETED", "TIMEOUT", "CANCELLED", "FAILED", "PREEMPTED"];
+        if (_fStates.indexOf(j.state) >= 0 && j.end_time) {
+            var _stMap = {"COMPLETED": "已结束", "TIMEOUT": "超时终止", "CANCELLED": "已取消", "FAILED": "已失败", "PREEMPTED": "被抢占"};
+            var _stClsMap = {"COMPLETED": "info", "TIMEOUT": "warning", "CANCELLED": "danger", "FAILED": "danger", "PREEMPTED": "secondary"};
+            stateDisplay = '<span class="badge bg-' + (_stClsMap[j.state] || 'info') + '">' + (_stMap[j.state] || j.state) + '@' + j.end_time + '</span>';
+        }
         document.getElementById("jobDetailInfo").innerHTML =
             '<table class="table table-sm"><tbody>' +
             '<tr><td>用户</td><td>' + j.user + '</td></tr>' +
@@ -1549,10 +1706,16 @@ function renderHistoryJobs() {
     });
     /* 排序 */
     var col = S.historySortCol, asc = S.historySortAsc;
+    var _stateOrder = {"RUNNING":0,"PENDING":1,"COMPLETING":2,"COMPLETED":3,"TIMEOUT":4,"CANCELLED":5,"FAILED":6};
     jobs.sort(function(a, b) {
         var va = a[col], vb = b[col];
         if (col === "job_id" || col === "num_cpus") {
             va = parseInt(va) || 0; vb = parseInt(vb) || 0;
+            return asc ? va - vb : vb - va;
+        }
+        if (col === "state") {
+            va = _stateOrder[va] !== undefined ? _stateOrder[va] : 9;
+            vb = _stateOrder[vb] !== undefined ? _stateOrder[vb] : 9;
             return asc ? va - vb : vb - va;
         }
         return asc ? String(va||"").localeCompare(String(vb||"")) : String(vb||"").localeCompare(String(va||""));
@@ -1561,9 +1724,9 @@ function renderHistoryJobs() {
     if (countEl) countEl.textContent = "共 " + jobs.length + " 条记录";
     var html = "";
     jobs.forEach(function(j) {
-        var stCls = j.state === "RUNNING" ? "success" : j.state === "COMPLETED" ? "info" : "secondary";
-        var stLabel = j.state === "COMPLETED" ? "已结束" : j.state === "RUNNING" ? "运行中" : j.state;
-        var endText = j.end_time || "-";
+        var stCls = j.state === "RUNNING" ? "success" : j.state === "COMPLETED" ? "info" : j.state === "TIMEOUT" ? "warning" : j.state === "CANCELLED" ? "danger" : j.state === "FAILED" ? "danger" : "secondary";
+        var stLabel = j.state === "COMPLETED" ? "已结束" : j.state === "RUNNING" ? "运行中" : j.state === "TIMEOUT" ? "超时终止" : j.state === "CANCELLED" ? "已取消" : j.state === "FAILED" ? "已失败" : j.state;
+        var endText = (j.state === "RUNNING" || j.state === "PENDING") ? "-" : (j.end_time || "-");
         var nameShort = j.name.length > 25 ? j.name.slice(0, 25) + "..." : j.name;
         html += '<tr onclick="openJobDetail(\'' + j.job_id + '\')" style="cursor:pointer">';
         html += '<td>' + j.job_id + '</td>';
@@ -1596,22 +1759,77 @@ function browseToDir(dir) {
 
 /* ===== FILE BROWSER ===== */
 function browsePath(p) {
+    var prevPath = S.filePath;
     S.filePath = p;
     var pi = document.getElementById("pathInput"); if (pi) pi.value = p;
     var url = "/api/files?path=" + encodeURIComponent(p);
     if (S.showFolderSizes) url += "&folder_sizes=1";
     fetch(url).then(function(r) { return r.json(); }).then(function(d) {
-        if (d.error) { alert(d.error); return; }
+        if (d.error) {
+            alert(d.error);
+            // 访问拒绝防呆：回到上一个位置
+            if (prevPath && prevPath !== p) {
+                S.filePath = prevPath;
+                if (pi) pi.value = prevPath;
+            }
+            return;
+        }
         S.filePath = d.path; if (pi) pi.value = d.path;
         renderFiles(d.entries || []);
-    }).catch(function(e) { console.warn("browse err:", e); });
+    }).catch(function(e) {
+        console.warn("browse err:", e);
+        if (prevPath && prevPath !== p) {
+            S.filePath = prevPath;
+            if (pi) pi.value = prevPath;
+        }
+    });
 }
 function browseParent() {
     if (!S.filePath) return;
     var parts = S.filePath.split("/"); parts.pop();
     browsePath(parts.join("/") || "/");
 }
-function refreshFiles() { browsePath(S.filePath || ""); }
+function browseHome() {
+    browsePath(S.clusterUsername ? ("/home/" + S.clusterUsername) : "");
+}
+function refreshFiles() {
+    browsePath(S.filePath || "");
+    loadDiskInfo();
+}
+
+/* 磁盘空间信息 */
+function loadDiskInfo() {
+    var path = S.filePath || "";
+    fetch("/api/disk-info?path=" + encodeURIComponent(path))
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            var el = document.getElementById("diskInfoText");
+            if (!el) return;
+            if (d.error) { el.textContent = ""; return; }
+            var total = formatSizeAuto(d.total);
+            var avail = formatSizeAuto(d.avail);
+            var used = formatSizeAuto(d.used);
+            var pct = d.total > 0 ? Math.round((d.total - d.avail) / d.total * 100) : 0;
+            var txt = d.mount + " 剩余:" + avail + "/" + total;
+            if (d.user_usage > 0) {
+                txt += " | 我的目录:" + formatSizeAuto(d.user_usage);
+            } else if (d.du_computing) {
+                txt += " | 我的目录:计算中...";
+            }
+            el.textContent = txt;
+            el.title = "分区: " + d.mount + "\n总量: " + total + "\n已用: " + used + " (" + pct + "%)\n可用: " + avail;
+            if (d.user_usage > 0) el.title += "\n我的目录 (" + (d.user_path || "") + "): " + formatSizeAuto(d.user_usage);
+        })
+        .catch(function() {});
+}
+function formatSizeAuto(bytes) {
+    if (bytes < 0) return "-";
+    if (bytes < 1024) return bytes + "B";
+    if (bytes < 1048576) return (bytes/1024).toFixed(1) + "KB";
+    if (bytes < 1073741824) return (bytes/1048576).toFixed(1) + "MB";
+    if (bytes < 1099511627776) return (bytes/1073741824).toFixed(1) + "GB";
+    return (bytes/1099511627776).toFixed(1) + "TB";
+}
 function sortFiles(col) {
     if (S.fileSortCol === col) S.fileSortAsc = !S.fileSortAsc;
     else { S.fileSortCol = col; S.fileSortAsc = true; }
@@ -1636,17 +1854,105 @@ function toggleFileViewMode() {
 function applyFileViewMode() {
     var browserCol = document.getElementById("fileBrowserCol");
     var editorCol = document.getElementById("fileEditorCol");
-    var toggleBtn = document.getElementById("btnViewMode");
+    var splitter = document.getElementById("fileSplitter");
+    var fsBtn = document.getElementById("btnFullscreen");
     if (S.fileViewMode === "full") {
-        browserCol.className = "col-12";
-        editorCol.classList.add("d-none");
-        if (toggleBtn) toggleBtn.innerHTML = '<i class="bi bi-layout-split"></i> 分栏';
+        browserCol.style.flex = "1";
+        browserCol.style.display = "";
+        if (editorCol) { editorCol.classList.add("d-none"); editorCol.style.flex = ""; }
+        if (splitter) splitter.classList.add("d-none");
+    } else if (S.fileViewMode === "fullscreen") {
+        browserCol.style.display = "none";
+        if (splitter) splitter.classList.add("d-none");
+        if (editorCol) { editorCol.classList.remove("d-none"); editorCol.style.flex = "1"; }
+        if (fsBtn) fsBtn.innerHTML = '<i class="bi bi-fullscreen-exit"></i>';
+        if (fsBtn) fsBtn.title = "退出全屏";
     } else {
-        browserCol.className = "col-md-5";
-        editorCol.classList.remove("d-none");
-        if (toggleBtn) toggleBtn.innerHTML = '<i class="bi bi-arrows-fullscreen"></i> 全屏';
+        browserCol.style.flex = "0 0 40%";
+        browserCol.style.display = "";
+        if (editorCol) { editorCol.classList.remove("d-none"); editorCol.style.flex = "1"; }
+        if (splitter) splitter.classList.remove("d-none");
+        if (fsBtn) fsBtn.innerHTML = '<i class="bi bi-arrows-fullscreen"></i>';
+        if (fsBtn) fsBtn.title = "全屏编辑";
     }
 }
+
+function closeEditor() {
+    S.fileViewMode = "full";
+    S.editingFile = null;
+    applyFileViewMode();
+}
+
+function fullscreenEditor() {
+    if (S.fileViewMode === "fullscreen") {
+        S.fileViewMode = "split";
+    } else {
+        S.fileViewMode = "fullscreen";
+    }
+    applyFileViewMode();
+}
+
+/* 复制选中内容 */
+function editorCopy() {
+    var ta = document.getElementById("editorTextarea");
+    if (!ta) return;
+    var sel = ta.value.substring(ta.selectionStart, ta.selectionEnd);
+    if (sel) {
+        navigator.clipboard.writeText(sel).then(function() {
+            S._hasCopied = true;
+            var btn = document.getElementById("btnPaste");
+            if (btn) btn.classList.remove("d-none");
+            showToast("已复制");
+        }).catch(function() { showToast("复制失败"); });
+    }
+}
+
+/* 粘贴 */
+function editorPaste() {
+    var ta = document.getElementById("editorTextarea");
+    if (!ta) return;
+    navigator.clipboard.readText().then(function(text) {
+        var start = ta.selectionStart;
+        var end = ta.selectionEnd;
+        ta.value = ta.value.substring(0, start) + text + ta.value.substring(end);
+        ta.selectionStart = ta.selectionEnd = start + text.length;
+        S.editDirty = true;
+        ta.focus();
+    }).catch(function() { showToast("粘贴失败"); });
+}
+
+/* 拖拽分割条 */
+(function() {
+    var splitterEl = document.getElementById("fileSplitter");
+    if (splitterEl) {
+        splitterEl.addEventListener("mousedown", function(e) {
+            e.preventDefault();
+            S._splitterDragging = true;
+            document.body.style.cursor = "col-resize";
+            document.body.style.userSelect = "none";
+        });
+    }
+    document.addEventListener("mousemove", function(e) {
+        if (!S._splitterDragging) return;
+        e.preventDefault();
+        var row = document.getElementById("fileRow");
+        if (!row) return;
+        var rect = row.getBoundingClientRect();
+        var x = e.clientX - rect.left;
+        var pct = Math.max(15, Math.min(85, (x / rect.width) * 100));
+        var browserCol = document.getElementById("fileBrowserCol");
+        var editorCol = document.getElementById("fileEditorCol");
+        if (browserCol) browserCol.style.flex = "0 0 " + pct + "%";
+        if (editorCol) editorCol.style.flex = "1";
+    });
+    document.addEventListener("mouseup", function() {
+        if (S._splitterDragging) {
+            S._splitterDragging = false;
+            document.body.style.cursor = "";
+            document.body.style.userSelect = "";
+        }
+    });
+})();
 
 function renderFiles(entries) {
     S._lastFileEntries = entries;
@@ -1727,6 +2033,12 @@ function viewFile(path) {
         var ta = document.getElementById("editorTextarea");
         ta.value = d.content; ta.style.display = "block";
         ta.oninput = function() { S.editDirty = true; };
+        // 监听选中事件以显示复制按钮
+        ta.onselect = function() {
+            var sel = ta.value.substring(ta.selectionStart, ta.selectionEnd);
+            var btn = document.getElementById("btnCopy");
+            if (btn) { if (sel) btn.classList.remove("d-none"); else btn.classList.add("d-none"); }
+        };
         hideEl("editorPlaceholder"); hideEl("previewContainer");
         showEditorButtons(true);
     }).catch(function(e) { alert("读取失败: " + e); });
@@ -1743,7 +2055,7 @@ function previewFile(path) {
         var ec = document.getElementById("fileEditorCol");
         container = document.createElement("div");
         container.id = "previewContainer";
-        container.style.cssText = "height:calc(100vh - 350px);overflow:auto;text-align:center;background:#1a1a1a;border-radius:6px;padding:10px";
+        container.style.cssText = "flex:1;overflow:auto;text-align:center;background:#1a1a1a;border-radius:6px;padding:10px";
         ec.appendChild(container);
     }
     container.style.display = "block";
@@ -1766,6 +2078,12 @@ function showEditorButtons(showEditBtns) {
     });
     var bd = document.getElementById("btnDownload");
     if (bd) bd.classList.remove("d-none");
+    // 复制按钮默认隐藏，选中文本时才显示
+    var bc = document.getElementById("btnCopy");
+    if (bc) bc.classList.add("d-none");
+    // 粘贴按钮仅在有复制内容时显示
+    var bp = document.getElementById("btnPaste");
+    if (bp) { if (S._hasCopied && showEditBtns) bp.classList.remove("d-none"); else bp.classList.add("d-none"); }
 }
 
 function editorUndo() { document.getElementById("editorTextarea").focus(); document.execCommand("undo"); }
@@ -2028,6 +2346,7 @@ function renderLoginNodeProcesses() {
         tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted py-3">无进程</td></tr>';
         return;
     }
+    /* 排序 */
     var col = S.loginSortCol, asc = S.loginSortAsc;
     procs.sort(function(a, b) {
         var va, vb;

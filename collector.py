@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -205,9 +206,21 @@ class DataCollector:
         self._numa_topo_cache: Dict[str, dict] = {}
         # SSH退化检测：连续全缓存周期计数
         self._consecutive_all_cached: int = 0
+        # 用户目录大小缓存：{path: {"usage": bytes, "ts": timestamp}}
+        self._du_cache: Dict[str, dict] = {}
+        self._du_computing: set = set()
         # 登录节点信息短时缓存，避免频繁全量扫描 /proc 与 ps
         self._login_node_info_cache: Dict[str, Any] = {}
         self._login_node_info_cache_ts: float = 0.0
+        # 文件列表短时缓存：{path: {"entries": [...], "ts": float}}，TTL=2秒
+        self._dir_cache: Dict[str, dict] = {}
+        self._DIR_CACHE_TTL = 2.0
+        # IO 线程池：用于不阻塞事件循环的文件系统操作
+        self._io_executor = ThreadPoolExecutor(max_workers=4)
+        # 用户设置缓存（避免每次采集都同步读 NFS）
+        self._user_settings_cache: dict = {}
+        self._user_settings_cache_ts: float = 0.0
+        self._USER_SETTINGS_TTL = 5.0
         os.makedirs(CACHE_DIR, exist_ok=True)
         self._load_cache()
         self._load_archived_jobs()
@@ -218,6 +231,20 @@ class DataCollector:
 
     def set_paused(self, val: bool):
         self._paused = val
+
+    def _load_user_settings_cached(self) -> dict:
+        """读取 user_settings.json（带 5 秒缓存，避免每次采集都同步读 NFS）"""
+        now = time.time()
+        if self._user_settings_cache and (now - self._user_settings_cache_ts) < self._USER_SETTINGS_TTL:
+            return self._user_settings_cache
+        try:
+            with open("user_settings.json", "r") as f:
+                self._user_settings_cache = json.load(f)
+                self._user_settings_cache_ts = now
+        except Exception:
+            if not self._user_settings_cache:
+                self._user_settings_cache = {}
+        return self._user_settings_cache
 
     async def _run_cmd(self, cmd: str, timeout: int = 10) -> Optional[str]:
         try:
@@ -497,7 +524,7 @@ class DataCollector:
             self._job_history[jid].append(point)
 
     def _save_cache(self):
-        """增量保存历史数据到批次文件"""
+        """增量保存历史数据到批次文件（NFS 写入提交到 IO 线程池）"""
         try:
             now = time.time()
             batch_data = {"node_history": {}, "job_history": {}, "timestamp": now}
@@ -511,9 +538,9 @@ class DataCollector:
                     batch_data["job_history"][k] = new_points
             if batch_data["node_history"] or batch_data["job_history"]:
                 filename = f"cache_{int(now)}.json"
-                path = os.path.join(CACHE_DIR, filename)
-                with open(path, "w") as f:
-                    json.dump(batch_data, f)
+                filepath = os.path.join(CACHE_DIR, filename)
+                payload = json.dumps(batch_data)
+                self._io_executor.submit(self._write_file_sync, filepath, payload)
                 logger.debug(f"Cache batch saved: {filename}")
             self._last_save_time = now
             self._cleanup_cache_files()
@@ -561,11 +588,17 @@ class DataCollector:
                 logger.info(f"Loaded {len(self._archived_jobs)} archived jobs from disk")
             except Exception as e:
                 logger.warning(f"Failed to load archived jobs: {e}")
+        # 注：残留 RUNNING 状态的修正在第一次采集时异步执行（_reconcile_stale_running_archived）
+        # 这样可以对比当前真正运行中的任务，避免误修正
 
     def _save_archived_jobs(self):
         """保存归档任务列表到磁盘"""
         try:
             archive_path = os.path.join(CACHE_DIR, "archived_jobs.json")
+            # 安全检查：如果内存中为空但磁盘文件有数据，不覆盖（防止丢失）
+            if not self._archived_jobs:
+                if os.path.exists(archive_path) and os.path.getsize(archive_path) > 10:
+                    return
             data = {}
             for jid, (ji, end_t) in self._archived_jobs.items():
                 data[jid] = {
@@ -587,13 +620,22 @@ class DataCollector:
         except Exception as e:
             logger.warning(f"Failed to save archived jobs: {e}")
 
+    @staticmethod
+    def _write_file_sync(path: str, content: str):
+        """同步写入文件（在 IO 线程池中调用，不阻塞事件循环）"""
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception as e:
+            logging.getLogger("collector").warning(f"Async file write failed: {path}: {e}")
+
     def get_archived_jobs_list(self) -> list:
         """返回归档任务列表（用于前端历史任务栏目）"""
         result = []
         # 包含归档任务（已结束的）
         for jid, (ji, end_t) in self._archived_jobs.items():
             d = self._job_to_dict(ji)
-            d["end_time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_t))
+            d["end_time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(end_t)) if end_t > 0 else ""
             d["end_timestamp"] = end_t
             result.append(d)
         # 包含当前正在运行且被追踪的用户的任务
@@ -915,14 +957,15 @@ class DataCollector:
                                 "cpu_percent": new_cpu,
                                 **mem_metrics,
                             }
-                            # 计算 job metrics
+                            # 计算 job metrics（使用 jid:node 复合键，与 Phase 2 一致）
                             for jid, cg in parsed.get("job_cgroups", {}).items():
                                 if cg["cpu_ns"] >= 0:
                                     node_cpus = 0
                                     if self._last_snapshot and node in self._last_snapshot.nodes:
                                         node_cpus = self._last_snapshot.nodes[node].cpus_total
                                     if node_cpus > 0:
-                                        job_cpu = self._compute_job_cpu_pct(jid, cg["cpu_ns"], node_cpus)
+                                        per_node_key = f"{jid}:{node}"
+                                        job_cpu = self._compute_job_cpu_pct(per_node_key, cg["cpu_ns"], node_cpus)
                                     else:
                                         job_cpu = -1
                                 else:
@@ -964,6 +1007,12 @@ class DataCollector:
         # 导致 idle 节点也可能显示很高的"已用"内存（实际大部分是可回收的磁盘缓存）。
         # 因此必须 SSH 到所有节点，通过 /proc/meminfo 读取 MemFree+Buffers+Cached 来正确计算。
         query_nodes = [n for n in nodes if "down" not in nodes[n].state.lower()]
+
+        # 节点记录过滤：用户设置中 record=false 的节点不进行 SSH 采集
+        from config import load_user_settings
+        _node_vis = load_user_settings().get("nodeVisibility", {})
+        if _node_vis:
+            query_nodes = [n for n in query_nodes if _node_vis.get(n, {}).get("record", True)]
         rt_results = {}
         if query_nodes:
             # 方案 1: paramiko 持久连接池（最快，无进程创建开销）
@@ -983,6 +1032,10 @@ class DataCollector:
 
         # Phase 2: 状态更新（加锁保证一致性）
         async with self._lock:
+            # ── 第一遍：更新节点级 metrics + 收集 job cgroup 原始数据（不直接写 job） ──
+            # job_cg_accum: {jid: {"mem_bytes": total, "cpu_per_node": {node: cpu_ns}}}
+            _job_cg_accum: Dict[str, dict] = {}
+
             for node_name, result in rt_results.items():
                 if node_name not in nodes:
                     continue
@@ -996,13 +1049,15 @@ class DataCollector:
                         node.mem_total_gb = saved.get("mem_total_gb", 0)
                         node.mem_used_gb = saved.get("mem_used_gb", 0)
                         node.mem_free_gb = saved.get("mem_free_gb", 0)
-                    # 沿用缓存的 job metrics
+                    # 缓存节点上的 job：沿用上次汇总后的 job metrics（不参与本轮累加）
                     for jid in node.jobs:
                         if jid in jobs:
                             saved_job = self._last_job_metrics.get(jid, {})
                             if saved_job:
-                                jobs[jid].cpu_percent = saved_job.get("cpu_percent", 0)
-                                jobs[jid].mem_used_gb = saved_job.get("mem_used_gb", 0)
+                                # 只在 job 尚未被其他新鲜节点设置时才回退缓存
+                                if jid not in _job_cg_accum:
+                                    jobs[jid].cpu_percent = saved_job.get("cpu_percent", 0)
+                                    jobs[jid].mem_used_gb = saved_job.get("mem_used_gb", 0)
                             else:
                                 # 冷启动兜底：单 job 节点用节点级内存近似
                                 if len(node.jobs) == 1 and node.mem_used_gb > 0:
@@ -1011,11 +1066,8 @@ class DataCollector:
                     # ── 新鲜数据：正常 delta 计算 ──
                     cpu_pct = self._compute_node_cpu_pct(node_name, result["cpu_stat"])
                     if cpu_pct >= 0:
-                        # 有效计算结果（包括真正的 0% 空闲节点）
                         node.cpu_percent = cpu_pct
                     elif cpu_pct < 0:
-                        # -1 表示计算失败（解析错误/无 prev/delta 异常）
-                        # 沿用上次已知的有效 CPU%
                         fallback_cpu = self._last_node_metrics.get(node_name, {}).get("cpu_percent", 0)
                         if fallback_cpu > 0:
                             node.cpu_percent = fallback_cpu
@@ -1029,25 +1081,19 @@ class DataCollector:
                         node.mem_total_gb = round(total_kb / 1048576.0, 2)
                         node.mem_used_gb = round(max(0, used_kb) / 1048576.0, 2)
                         node.mem_free_gb = round(node.mem_total_gb - node.mem_used_gb, 2)
+                    # ── 收集 job cgroup 数据到累加器（不直接覆盖 job 对象） ──
                     for jid, cg in result["job_cgroups"].items():
                         matched_jobs = [j for j in node.jobs if j == jid or j.startswith(jid + "_")]
                         for mj in matched_jobs:
-                            if mj in jobs:
-                                if cg["cpu_ns"] >= 0:
-                                    job_cpu = self._compute_job_cpu_pct(
-                                        mj, cg["cpu_ns"], node.cpus_total
-                                    )
-                                    if job_cpu >= 0:
-                                        jobs[mj].cpu_percent = job_cpu
-                                    else:
-                                        # 首次无 prev，沿用上次有效值
-                                        fallback = self._last_job_metrics.get(mj, {}).get("cpu_percent", 0)
-                                        if fallback > 0:
-                                            jobs[mj].cpu_percent = fallback
-                                if cg["mem_bytes"] >= 0:
-                                    jobs[mj].mem_used_gb = round(cg["mem_bytes"] / (1024**3), 3)
-                    # 保存本次计算的 metrics，供下次缓存使用
-                    # 注意：不让首轮 delta=0 的 cpu_percent 覆盖缓存中可能存在的有效值
+                            if mj not in jobs:
+                                continue
+                            if mj not in _job_cg_accum:
+                                _job_cg_accum[mj] = {"mem_bytes": 0, "cpu_per_node": {}}
+                            if cg["mem_bytes"] >= 0:
+                                _job_cg_accum[mj]["mem_bytes"] += cg["mem_bytes"]
+                            if cg["cpu_ns"] >= 0:
+                                _job_cg_accum[mj]["cpu_per_node"][node_name] = (cg["cpu_ns"], node.cpus_total)
+                    # 保存节点 metrics
                     old_metrics = self._last_node_metrics.get(node_name, {})
                     self._last_node_metrics[node_name] = {
                         "cpu_percent": node.cpu_percent if node.cpu_percent > 0 else old_metrics.get("cpu_percent", 0),
@@ -1055,13 +1101,35 @@ class DataCollector:
                         "mem_used_gb": node.mem_used_gb,
                         "mem_free_gb": node.mem_free_gb,
                     }
-                    for jid in node.jobs:
-                        if jid in jobs:
-                            old_job = self._last_job_metrics.get(jid, {})
-                            self._last_job_metrics[jid] = {
-                                "cpu_percent": jobs[jid].cpu_percent if jobs[jid].cpu_percent > 0 else old_job.get("cpu_percent", 0),
-                                "mem_used_gb": jobs[jid].mem_used_gb if jobs[jid].mem_used_gb > 0 else old_job.get("mem_used_gb", 0),
-                            }
+
+            # ── 第二遍：汇总所有节点的 cgroup 数据后设置 job metrics ──
+            for jid, accum in _job_cg_accum.items():
+                if jid not in jobs:
+                    continue
+                # 内存：所有节点的 cgroup 内存之和
+                if accum["mem_bytes"] > 0:
+                    jobs[jid].mem_used_gb = round(accum["mem_bytes"] / (1024**3), 3)
+                # CPU%：每个节点独立做 delta 计算，然后求和
+                total_cpu_pct = 0.0
+                valid_count = 0
+                for nd_name, (cpu_ns, nd_cpus) in accum["cpu_per_node"].items():
+                    per_node_key = f"{jid}:{nd_name}"
+                    pct = self._compute_job_cpu_pct(per_node_key, cpu_ns, nd_cpus)
+                    if pct >= 0:
+                        total_cpu_pct += pct
+                        valid_count += 1
+                if valid_count > 0:
+                    jobs[jid].cpu_percent = round(total_cpu_pct, 2)
+                else:
+                    fallback = self._last_job_metrics.get(jid, {}).get("cpu_percent", 0)
+                    if fallback > 0:
+                        jobs[jid].cpu_percent = fallback
+                # 更新 job metrics 缓存
+                old_job = self._last_job_metrics.get(jid, {})
+                self._last_job_metrics[jid] = {
+                    "cpu_percent": jobs[jid].cpu_percent if jobs[jid].cpu_percent > 0 else old_job.get("cpu_percent", 0),
+                    "mem_used_gb": jobs[jid].mem_used_gb if jobs[jid].mem_used_gb > 0 else old_job.get("mem_used_gb", 0),
+                }
 
             # ── 最终兜底：有活跃任务但 CPU=0% 的节点，用上一轮 snapshot 的数据替代 ──
             # 这发生在 warm-up 首轮（无 delta）或 backfill 尚未完成时
@@ -1089,25 +1157,21 @@ class DataCollector:
             # ── 检测最近结束的任务：上一轮存在但本轮消失的 RUNNING 任务 ──
             now = time.time()
             _newly_finished_jids = []
-            # 加载追踪用户设置
-            _cluster_user = ""
-            try:
-                with open("user_settings.json", "r") as f:
-                    _us = json.load(f)
-                    track_users = set(u.strip() for u in _us.get("historyTrackUsers", "").split(",") if u.strip())
-                    retain_sec = _us.get("historyDurationMin", 60) * 60
-                    _cluster_user = _us.get("clusterUsername", "")
-            except Exception:
-                track_users = set()
-                retain_sec = 3600
+            # 加载追踪用户设置（使用缓存，避免每次采集都读 NFS）
+            _us = self._load_user_settings_cached()
+            _cluster_user = _us.get("clusterUsername", "")
+            track_users = set(u.strip() for u in _us.get("historyTrackUsers", "").split(",") if u.strip())
+            retain_sec = _us.get("historyDurationMin", 60) * 60
             if self._last_snapshot:
                 _archive_changed = False
                 for jid, prev_job in self._last_snapshot.jobs.items():
-                    if prev_job.state == "RUNNING" and jid not in jobs:
+                    if prev_job.state in ("RUNNING", "COMPLETING", "TIMEOUT", "CANCELLED", "FAILED", "PREEMPTED") and jid not in jobs:
                         # 任务从 squeue 消失，说明已结束
+                        # 保留原始终止状态（TIMEOUT/CANCELLED/FAILED），RUNNING→COMPLETED
+                        _final_state = prev_job.state if prev_job.state in ("TIMEOUT", "CANCELLED", "FAILED", "PREEMPTED") else "COMPLETED"
                         finished_job = JobInfo(
                             job_id=prev_job.job_id, name=prev_job.name,
-                            user=prev_job.user, state="COMPLETED",
+                            user=prev_job.user, state=_final_state,
                             partition=prev_job.partition, nodes=prev_job.nodes,
                             num_cpus=prev_job.num_cpus, num_nodes=prev_job.num_nodes,
                             time_used=prev_job.time_used, time_limit=prev_job.time_limit,
@@ -1129,8 +1193,9 @@ class DataCollector:
                 for jid, job in jobs.items():
                     if job.user in track_users and job.state == "RUNNING":
                         if jid in self._archived_jobs:
-                            # 更新运行中任务的最新指标
-                            self._archived_jobs[jid] = (job, 0)
+                            # 更新运行中任务的最新指标，保留已有的结束时间
+                            old_end_t = self._archived_jobs[jid][1]
+                            self._archived_jobs[jid] = (job, old_end_t if old_end_t > 0 else 0)
                             _archive_changed = True
                 if _archive_changed:
                     self._save_archived_jobs()
@@ -1166,6 +1231,11 @@ class DataCollector:
             if _cluster_user and self._collect_count % 3 == 0:
                 asyncio.create_task(self._collect_job_logs(jobs, _cluster_user))
 
+            # 第一次采集：异步修正归档中状态残留为 RUNNING 的已结束任务
+            # 注意：_collect_count 在上方已自增，第一次采集完成后为 1
+            if self._collect_count == 1:
+                asyncio.create_task(self._reconcile_stale_running_archived(set(jobs.keys())))
+
             # 异步采集 NUMA 内存分布趋势（每6个采集周期执行一次，减少 SSH 开销）
             try:
                 with open("user_settings.json", "r") as f:
@@ -1177,6 +1247,45 @@ class DataCollector:
                 asyncio.create_task(self._collect_job_numa(jobs, _cluster_user))
 
             return snapshot
+
+    async def _reconcile_stale_running_archived(self, current_running_jids: set):
+        """服务重启后，修正归档中状态仍为 RUNNING 但实际已结束的任务。
+        通过 sacct 查询真实最终状态（TIMEOUT/CANCELLED/FAILED/COMPLETED）。
+        仅在第一次采集时触发一次，避免离线期间结束的任务永久显示为 RUNNING。
+        """
+        async with self._lock:
+            stale = [
+                jid for jid, (ji, _) in self._archived_jobs.items()
+                if ji.state == "RUNNING" and jid not in current_running_jids
+            ]
+        if not stale:
+            return
+        logger.info(f"检测到 {len(stale)} 个归档任务状态残留 RUNNING，正在用 sacct 修正：{stale}")
+        try:
+            jids_str = ",".join(stale)
+            cmd = f"sacct -j {jids_str} --format=JobID,State --noheader --parsable2 2>/dev/null"
+            out = await self._run_cmd(cmd, timeout=15)
+            # 解析 sacct 输出：jobid|state（可能有 .batch .extern 步骤，只取无点的行）
+            sacct_states: Dict[str, str] = {}
+            for line in out.strip().splitlines():
+                parts = line.strip().split("|")
+                if len(parts) >= 2 and "." not in parts[0]:
+                    raw_state = parts[1].split(" ")[0]  # 去掉 by xxx 后缀
+                    sacct_states[parts[0]] = raw_state
+            changed = False
+            async with self._lock:
+                for jid in stale:
+                    final = sacct_states.get(jid, "COMPLETED")
+                    if jid in self._archived_jobs:
+                        ji, end_t = self._archived_jobs[jid]
+                        ji.state = final
+                        self._archived_jobs[jid] = (ji, end_t)
+                        changed = True
+                        logger.info(f"归档任务 {jid} 状态修正：RUNNING -> {final}")
+                if changed:
+                    self._save_archived_jobs()
+        except Exception as e:
+            logger.warning(f"_reconcile_stale_running_archived 失败：{e}")
 
     async def _fetch_finished_log_paths(self, job_ids: list):
         """异步获取已结束任务的 stdout/stderr 文件路径（通过 scontrol）"""
@@ -1609,6 +1718,83 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
                 cpus.add(int(part))
         return cpus
 
+    async def get_job_log(self, job_id: str, log_type: str = "stdout", tail: int = 200) -> Optional[str]:
+        """获取任务日志，优先使用周期采集缓存，回退到 scontrol → recently_finished → archived_jobs"""
+        # 优先从周期采集缓存读取（运行中的作业，数据更新鲜）
+        cached = self._job_log_cache.get(job_id)
+        if cached:
+            content = cached.get(log_type, "")
+            if content:
+                return content
+
+        details = await self.get_job_details(job_id)
+        if not details:
+            # scontrol 找不到任务，依次从 recently_finished 和 archived_jobs 提取路径
+            finished = self._recently_finished.get(job_id)
+            if not finished:
+                finished = self._archived_jobs.get(job_id)
+            if finished:
+                fj = finished[0]
+                path = fj.stderr_path if log_type == "stderr" else fj.stdout_path
+                if path and path != "/dev/null":
+                    out = await self._run_cmd(f"tail -n {tail} '{path}' 2>&1", timeout=5)
+                    return out if out else f"Cannot read {path}"
+            return None
+        if log_type == "stderr":
+            path = details.get("StdErr", "")
+        else:
+            path = details.get("StdOut", "")
+        if not path or path == "/dev/null":
+            return f"No {log_type} file configured for job {job_id}"
+        out = await self._run_cmd(f"tail -n {tail} '{path}' 2>&1", timeout=5)
+        return out if out else f"Cannot read {path}"
+
+    async def get_disk_info(self, path: str) -> dict:
+        """获取指定路径所在分区的磁盘空间信息（df即时返回，du后台缓存）"""
+        import config as _cfg
+        safe_path = shlex.quote(path)
+        try:
+            out = await self._run_cmd(f"df -B1 {safe_path} 2>/dev/null | tail -1", timeout=5)
+            if out:
+                parts = out.split()
+                if len(parts) >= 6:
+                    total = int(parts[1])
+                    used = int(parts[2])
+                    avail = int(parts[3])
+                    mount = parts[5]
+                    # 用户主目录占用：使用缓存，不阻塞
+                    settings = _cfg.load_user_settings()
+                    cluster_user = settings.get("clusterUsername", "")
+                    home = ("/home/" + cluster_user) if cluster_user else os.path.expanduser("~")
+                    cached = self._du_cache.get(home)
+                    user_usage = cached["usage"] if cached else -1
+                    du_computing = home in self._du_computing
+                    # 缓存过期（>5分钟）或不存在时启动后台计算
+                    if (not cached or time.time() - cached.get("ts", 0) > 300) and not du_computing:
+                        asyncio.create_task(self._compute_du_async(home))
+                    return {
+                        "mount": mount, "total": total, "used": used, "avail": avail,
+                        "user_usage": user_usage, "user_path": home,
+                        "du_computing": du_computing, "path": path
+                    }
+        except Exception as e:
+            logger.error(f"get_disk_info error: {e}")
+        return {"error": "无法获取磁盘信息", "path": path}
+
+    async def _compute_du_async(self, path: str):
+        """后台异步计算目录大小并缓存"""
+        self._du_computing.add(path)
+        safe = shlex.quote(path)
+        try:
+            out = await self._run_cmd(f"du -sb {safe} 2>/dev/null | cut -f1", timeout=120)
+            if out and out.strip().isdigit():
+                self._du_cache[path] = {"usage": int(out.strip()), "ts": time.time()}
+                logger.info(f"du cache updated: {path} = {self._du_cache[path]['usage']} bytes")
+        except Exception as e:
+            logger.error(f"du computation error: {e}")
+        finally:
+            self._du_computing.discard(path)
+
     async def get_login_node_info(self) -> dict:
         """获取登录节点系统信息和用户进程列表"""
         now = time.time()
@@ -1723,72 +1909,68 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
         result = await self._run_cmd(f"kill {pid} 2>&1", timeout=3)
         if result is not None:
             return {"success": True, "message": f"已发送终止信号到进程 {pid}"}
+        # kill 返回非零退出码
         result2 = await self._run_cmd(f"kill -0 {pid} 2>&1", timeout=3)
         if result2 is None:
             return {"success": False, "message": f"无法终止进程 {pid}（可能无权限或进程不存在）"}
         return {"success": True, "message": f"已发送终止信号到进程 {pid}"}
 
-    async def get_job_log(self, job_id: str, log_type: str = "stdout", tail: int = 200) -> Optional[str]:
-        """获取任务日志，优先使用周期采集缓存，回退到 scontrol → recently_finished → archived_jobs"""
-        # 优先从周期采集缓存读取（运行中的作业，数据更新鲜）
-        cached = self._job_log_cache.get(job_id)
-        if cached:
-            content = cached.get(log_type, "")
-            if content:
-                return content
-
-        details = await self.get_job_details(job_id)
-        if not details:
-            # scontrol 找不到任务，依次从 recently_finished 和 archived_jobs 提取路径
-            finished = self._recently_finished.get(job_id)
-            if not finished:
-                finished = self._archived_jobs.get(job_id)
-            if finished:
-                fj = finished[0]
-                path = fj.stderr_path if log_type == "stderr" else fj.stdout_path
-                if path and path != "/dev/null":
-                    out = await self._run_cmd(f"tail -n {tail} '{path}' 2>&1", timeout=5)
-                    return out if out else f"Cannot read {path}"
-            return None
-        if log_type == "stderr":
-            path = details.get("StdErr", "")
-        else:
-            path = details.get("StdOut", "")
-        if not path or path == "/dev/null":
-            return f"No {log_type} file configured for job {job_id}"
-        out = await self._run_cmd(f"tail -n {tail} '{path}' 2>&1", timeout=5)
-        return out if out else f"Cannot read {path}"
-
     async def list_directory(self, path: str, compute_dir_sizes: bool = False) -> List[dict]:
+        """列出目录内容（带 TTL 缓存 + 线程池非阻塞 IO）"""
+        # ── TTL 缓存：相同目录 2 秒内直接返回 ──
+        cache_key = f"{path}|{compute_dir_sizes}"
+        cached = self._dir_cache.get(cache_key)
+        if cached and (time.time() - cached["ts"]) < self._DIR_CACHE_TTL:
+            return cached["entries"]
+
+        # ── 在线程池中执行阻塞的 NFS 操作，不阻塞事件循环 ──
+        loop = asyncio.get_event_loop()
+        entries = await loop.run_in_executor(
+            self._io_executor, self._list_directory_sync, path
+        )
+
+        # Compute dir sizes in parallel (max 20 concurrent)
+        if compute_dir_sizes:
+            dir_tasks = [(i, e["_full"]) for i, e in enumerate(entries) if e["type"] == "dir"]
+            if dir_tasks:
+                tasks = [self._get_dir_size(full) for _, full in dir_tasks]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for (idx, _), result in zip(dir_tasks, results):
+                    if isinstance(result, int) and result > 0:
+                        entries[idx]["size"] = result
+
+        # 去掉内部辅助字段
+        for e in entries:
+            e.pop("_full", None)
+
+        # 更新缓存
+        self._dir_cache[cache_key] = {"entries": entries, "ts": time.time()}
+        # 清理过期缓存条目（防止内存泄漏）
+        stale = [k for k, v in self._dir_cache.items() if time.time() - v["ts"] > 30]
+        for k in stale:
+            del self._dir_cache[k]
+
+        return entries
+
+    def _list_directory_sync(self, path: str) -> List[dict]:
+        """同步扫描目录（在线程池中调用，用 os.scandir 减少系统调用）"""
         entries = []
-        dir_tasks = []  # (index, full_path) for async size computation
         try:
-            for entry in sorted(os.listdir(path)):
-                full = os.path.join(path, entry)
-                try:
-                    st = os.stat(full)
-                    is_dir = os.path.isdir(full)
-                    size = st.st_size
-                    idx = len(entries)
-                    entries.append({
-                        "name": entry,
-                        "type": "dir" if is_dir else "file",
-                        "size": size,
-                        "mtime": st.st_mtime
-                    })
-                    if is_dir and compute_dir_sizes:
-                        dir_tasks.append((idx, full))
-                except OSError:
-                    pass
+            with os.scandir(path) as it:
+                for de in sorted(it, key=lambda x: x.name):
+                    try:
+                        st = de.stat()
+                        entries.append({
+                            "name": de.name,
+                            "type": "dir" if de.is_dir() else "file",
+                            "size": st.st_size,
+                            "mtime": st.st_mtime,
+                            "_full": de.path,
+                        })
+                    except OSError:
+                        pass
         except OSError as e:
             logger.error(f"Cannot list directory {path}: {e}")
-        # Compute dir sizes in parallel (max 20 concurrent)
-        if dir_tasks:
-            tasks = [self._get_dir_size(full) for _, full in dir_tasks]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for (idx, _), result in zip(dir_tasks, results):
-                if isinstance(result, int) and result > 0:
-                    entries[idx]["size"] = result
         return entries
 
     async def _get_dir_size(self, path: str) -> int:
@@ -1802,6 +1984,13 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
         return -1
 
     async def read_file_content(self, path: str, max_size: int = 1048576) -> Optional[str]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._io_executor, self._read_file_sync, path, max_size
+        )
+
+    @staticmethod
+    def _read_file_sync(path: str, max_size: int) -> Optional[str]:
         try:
             if os.path.getsize(path) > max_size:
                 return f"[File too large: {os.path.getsize(path)} bytes, limit {max_size}]"
@@ -1811,7 +2000,14 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
             return f"[Error reading file: {e}]"
 
     async def save_file_content(self, path: str, content: str) -> dict:
-        """保存文本内容到文件"""
+        """保存文本内容到文件（在线程池中执行 NFS 写入）"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._io_executor, self._save_file_sync, path, content
+        )
+
+    @staticmethod
+    def _save_file_sync(path: str, content: str) -> dict:
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
@@ -1892,8 +2088,15 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
         return {"success": True, "message": out.strip() if out.strip() else "脚本执行完毕（无输出）"}
 
     def snapshot_to_dict(self, snap: ClusterSnapshot) -> dict:
+        from config import load_user_settings
+        _node_vis = load_user_settings().get("nodeVisibility", {})
+
         nodes_list = []
         for n in snap.nodes.values():
+            # 如果节点设置为不显示，则跳过
+            vis = _node_vis.get(n.name, {})
+            if vis and not vis.get("show", True):
+                continue
             nodes_list.append({
                 "name": n.name, "state": n.state,
                 "cpus_total": n.cpus_total, "cpus_alloc": n.cpus_alloc, "cpus_idle": n.cpus_idle,
@@ -1910,25 +2113,30 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
             d["end_timestamp"] = end_t
             jobs_list.append(d)
         parts_list = []
+        visible_node_names = set(nd["name"] for nd in nodes_list)
         for p in snap.partitions.values():
+            # 过滤分区内的节点列表，只保留可见节点
+            filtered_node_list = [n for n in p.node_list if n in visible_node_names] if _node_vis else p.node_list
             parts_list.append({
                 "name": p.name, "state": p.state,
                 "nodes_total": p.nodes_total, "nodes_idle": p.nodes_idle,
                 "nodes_alloc": p.nodes_alloc, "nodes_down": p.nodes_down,
                 "cpus_total": p.cpus_total, "cpus_alloc": p.cpus_alloc,
                 "timelimit": p.timelimit,
-                "node_list": p.node_list
+                "node_list": filtered_node_list
             })
-        total_cpus = sum(n.cpus_total for n in snap.nodes.values())
-        alloc_cpus = sum(n.cpus_alloc for n in snap.nodes.values())
-        total_mem = sum(n.mem_total_gb for n in snap.nodes.values())
-        used_mem = sum(n.mem_used_gb for n in snap.nodes.values())
+        # Summary 使用可见节点统计
+        visible_nodes = [snap.nodes[nd["name"]] for nd in nodes_list if nd["name"] in snap.nodes]
+        total_cpus = sum(n.cpus_total for n in visible_nodes)
+        alloc_cpus = sum(n.cpus_alloc for n in visible_nodes)
+        total_mem = sum(n.mem_total_gb for n in visible_nodes)
+        used_mem = sum(n.mem_used_gb for n in visible_nodes)
         running = sum(1 for j in snap.jobs.values() if j.state == "RUNNING")
         pending = sum(1 for j in snap.jobs.values() if j.state == "PENDING")
         return {
             "timestamp": snap.timestamp,
             "summary": {
-                "total_nodes": len(snap.nodes),
+                "total_nodes": len(visible_nodes),
                 "total_cpus": total_cpus, "alloc_cpus": alloc_cpus,
                 "total_mem_gb": round(total_mem, 2), "used_mem_gb": round(used_mem, 2),
                 "running_jobs": running, "pending_jobs": pending,
@@ -1936,7 +2144,10 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
             },
             "nodes": sorted(nodes_list, key=lambda x: x["name"]),
             "jobs": sorted(jobs_list, key=lambda x: x["job_id"]),
-            "partitions": sorted(parts_list, key=lambda x: x["name"])
+            "partitions": sorted(parts_list, key=lambda x: x["name"]),
+            "all_partitions": sorted([{
+                "name": p.name, "node_list": p.node_list
+            } for p in snap.partitions.values()], key=lambda x: x["name"])
         }
 
     def _job_to_dict(self, j: JobInfo) -> dict:
