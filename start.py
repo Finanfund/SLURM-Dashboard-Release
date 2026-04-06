@@ -20,7 +20,7 @@ CACHE_DIR = os.path.join(SCRIPT_DIR, ".cache")
 
 def find_python():
     """Find the correct Python with FastAPI installed."""
-    for p in [sys.executable, os.path.expanduser("~/.conda/bin/python"), "python3", "python"]:
+    for p in [sys.executable, "python3", "python"]:
         try:
             out = subprocess.check_output([p, "-c", "import fastapi; print('ok')"],
                                           stderr=subprocess.DEVNULL).decode().strip()

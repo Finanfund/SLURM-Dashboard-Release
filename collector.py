@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Any
 from collections import deque
-from config import SSH_OPTIONS, SSH_TIMEOUT, HISTORY_MAX_POINTS, CACHE_DIR, SCRIPT_DIR, load_user_settings
+from config import SSH_OPTIONS, SSH_TIMEOUT, HISTORY_MAX_POINTS, CACHE_DIR, SCRIPT_DIR
 
 logger = logging.getLogger("collector")
 
@@ -205,6 +205,9 @@ class DataCollector:
         self._numa_topo_cache: Dict[str, dict] = {}
         # SSH退化检测：连续全缓存周期计数
         self._consecutive_all_cached: int = 0
+        # 登录节点信息短时缓存，避免频繁全量扫描 /proc 与 ps
+        self._login_node_info_cache: Dict[str, Any] = {}
+        self._login_node_info_cache_ts: float = 0.0
         os.makedirs(CACHE_DIR, exist_ok=True)
         self._load_cache()
         self._load_archived_jobs()
@@ -596,8 +599,9 @@ class DataCollector:
         # 包含当前正在运行且被追踪的用户的任务
         if self._last_snapshot:
             try:
-                _us = load_user_settings()
-                track_users = set(u.strip() for u in (_us.get("historyTrackUsers", "") or "").split(",") if u.strip())
+                with open("user_settings.json", "r") as f:
+                    _us = json.load(f)
+                    track_users = set(u.strip() for u in _us.get("historyTrackUsers", "").split(",") if u.strip())
             except Exception:
                 track_users = set()
             for jid, ji in self._last_snapshot.jobs.items():
@@ -1088,10 +1092,11 @@ class DataCollector:
             # 加载追踪用户设置
             _cluster_user = ""
             try:
-                _us = load_user_settings()
-                track_users = set(u.strip() for u in (_us.get("historyTrackUsers", "") or "").split(",") if u.strip())
-                retain_sec = _us.get("historyDurationMin", 60) * 60
-                _cluster_user = (_us.get("clusterUsername", "") or "").strip()
+                with open("user_settings.json", "r") as f:
+                    _us = json.load(f)
+                    track_users = set(u.strip() for u in _us.get("historyTrackUsers", "").split(",") if u.strip())
+                    retain_sec = _us.get("historyDurationMin", 60) * 60
+                    _cluster_user = _us.get("clusterUsername", "")
             except Exception:
                 track_users = set()
                 retain_sec = 3600
@@ -1157,8 +1162,8 @@ class DataCollector:
             if _newly_finished_jids:
                 asyncio.create_task(self._fetch_finished_log_paths(_newly_finished_jids))
 
-            # 异步采集追踪用户运行中作业的 stdout/stderr 输出
-            if _cluster_user:
+            # 异步采集追踪用户运行中作业的 stdout/stderr 输出（每3个周期执行一次，减少系统负载）
+            if _cluster_user and self._collect_count % 3 == 0:
                 asyncio.create_task(self._collect_job_logs(jobs, _cluster_user))
 
             # 异步采集 NUMA 内存分布趋势（每6个采集周期执行一次，减少 SSH 开销）
@@ -1231,11 +1236,11 @@ class DataCollector:
                 stdout_content = ""
                 if stdout_path and stdout_path != "/dev/null":
                     stdout_content = await self._run_cmd(
-                        f"tail -n 500 '{stdout_path}' 2>&1", timeout=3) or ""
+                        f"tail -n 200 '{stdout_path}' 2>&1", timeout=3) or ""
                 stderr_content = ""
                 if stderr_path and stderr_path != "/dev/null":
                     stderr_content = await self._run_cmd(
-                        f"tail -n 500 '{stderr_path}' 2>&1", timeout=3) or ""
+                        f"tail -n 200 '{stderr_path}' 2>&1", timeout=3) or ""
 
                 self._job_log_cache[jid] = {
                     "stdout": stdout_content,
@@ -1603,6 +1608,125 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
             elif part.isdigit():
                 cpus.add(int(part))
         return cpus
+
+    async def get_login_node_info(self) -> dict:
+        """获取登录节点系统信息和用户进程列表"""
+        now = time.time()
+        if self._login_node_info_cache and now - self._login_node_info_cache_ts < 2.0:
+            return dict(self._login_node_info_cache)
+
+        result = {
+            "hostname": "unknown",
+            "load_1": 0.0,
+            "load_5": 0.0,
+            "load_15": 0.0,
+            "cpus": 0,
+            "mem_total": 0,
+            "mem_used": 0,
+            "mem_free": 0,
+            "mem_available": 0,
+            "uptime": "-",
+            "online_users": 0,
+            "processes": [],
+        }
+        try:
+            result["hostname"] = os.uname().nodename
+        except Exception:
+            pass
+        try:
+            load1, load5, load15 = os.getloadavg()
+            result["load_1"] = float(load1)
+            result["load_5"] = float(load5)
+            result["load_15"] = float(load15)
+        except Exception:
+            pass
+        try:
+            result["cpus"] = os.cpu_count() or 0
+        except Exception:
+            pass
+        try:
+            meminfo = {}
+            with open("/proc/meminfo", "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if ":" not in line:
+                        continue
+                    key, value = line.split(":", 1)
+                    token = value.strip().split()
+                    if token and token[0].isdigit():
+                        meminfo[key] = int(token[0]) * 1024
+            mem_total = meminfo.get("MemTotal", 0)
+            mem_free = meminfo.get("MemFree", 0)
+            mem_available = meminfo.get("MemAvailable", mem_free)
+            mem_used = max(mem_total - mem_available, 0)
+            result["mem_total"] = mem_total
+            result["mem_used"] = mem_used
+            result["mem_free"] = mem_free
+            result["mem_available"] = mem_available
+        except Exception:
+            pass
+        try:
+            with open("/proc/uptime", "r", encoding="utf-8", errors="replace") as f:
+                uptime_sec = int(float(f.read().split()[0]))
+            days, rem = divmod(uptime_sec, 86400)
+            hours, rem = divmod(rem, 3600)
+            minutes, _ = divmod(rem, 60)
+            parts = []
+            if days:
+                parts.append(f"{days}d")
+            if hours:
+                parts.append(f"{hours}h")
+            if minutes or not parts:
+                parts.append(f"{minutes}m")
+            result["uptime"] = " ".join(parts)
+        except Exception:
+            pass
+        try:
+            who_out = await self._run_cmd("who | wc -l", timeout=2)
+            result["online_users"] = int(who_out.strip()) if who_out and who_out.strip().isdigit() else 0
+        except Exception:
+            pass
+        try:
+            ps_out = await self._run_cmd(
+                "ps -eo user,pid,stat,etime,%cpu,%mem,rss,cmd --no-headers --sort=-%cpu 2>/dev/null | head -50",
+                timeout=3
+            )
+            processes = []
+            if ps_out:
+                for line in ps_out.strip().split("\n"):
+                    parts = line.split(None, 7)
+                    if len(parts) >= 8:
+                        try:
+                            processes.append({
+                                "user": parts[0],
+                                "pid": int(parts[1]),
+                                "state": parts[2],
+                                "elapsed": parts[3],
+                                "cpu_pct": float(parts[4]),
+                                "mem_pct": float(parts[5]),
+                                "rss_kb": int(parts[6]),
+                                "cmd": parts[7]
+                            })
+                        except (ValueError, IndexError):
+                            continue
+            result["processes"] = processes
+        except Exception:
+            pass
+
+        self._login_node_info_cache = dict(result)
+        self._login_node_info_cache_ts = now
+        return result
+
+    async def kill_process(self, pid: int) -> dict:
+        """终止登录节点上的指定进程（仅限当前用户的进程）"""
+        if not isinstance(pid, int) or pid <= 0:
+            return {"success": False, "message": "无效的进程ID"}
+        result = await self._run_cmd(f"kill {pid} 2>&1", timeout=3)
+        if result is not None:
+            return {"success": True, "message": f"已发送终止信号到进程 {pid}"}
+        result2 = await self._run_cmd(f"kill -0 {pid} 2>&1", timeout=3)
+        if result2 is None:
+            return {"success": False, "message": f"无法终止进程 {pid}（可能无权限或进程不存在）"}
+        return {"success": True, "message": f"已发送终止信号到进程 {pid}"}
 
     async def get_job_log(self, job_id: str, log_type: str = "stdout", tail: int = 200) -> Optional[str]:
         """获取任务日志，优先使用周期采集缓存，回退到 scontrol → recently_finished → archived_jobs"""

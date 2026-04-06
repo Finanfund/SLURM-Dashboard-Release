@@ -97,6 +97,13 @@ async def lifespan(app: FastAPI):
         await bg_task
     except asyncio.CancelledError:
         pass
+    # 关闭前保存缓存和归档，确保不丢失历史数据
+    try:
+        collector._save_cache()
+        collector._save_archived_jobs()
+        logger.info("Shutdown: cache and archived jobs saved successfully")
+    except Exception as e:
+        logger.error(f"Shutdown save error: {e}")
 
 
 app = FastAPI(title="SLURM Dashboard", lifespan=lifespan)
@@ -524,6 +531,24 @@ async def api_clear_cache():
 async def api_cache_stats():
     """获取缓存统计信息"""
     return collector.get_cache_stats()
+
+
+# ── 登录节点管理 ──
+@app.get("/api/login-node/info")
+async def api_login_node_info():
+    """获取登录节点系统信息和用户进程列表"""
+    result = await collector.get_login_node_info()
+    return JSONResponse(content=result, headers={"Content-Type": "application/json; charset=utf-8"})
+
+@app.post("/api/login-node/kill")
+async def api_login_node_kill(request: Request):
+    """终止登录节点上的指定进程"""
+    body = await request.json()
+    pid = body.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return JSONResponse({"success": False, "message": "无效的进程ID"}, status_code=400)
+    result = await collector.kill_process(pid)
+    return JSONResponse(content=result)
 
 
 if __name__ == "__main__":

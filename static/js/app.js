@@ -7,6 +7,8 @@ var S = {
     selectedNode: null,
     jobSortCol: "job_id", jobSortAsc: true, jobFilter: "all",
     historySortCol: "job_id", historySortAsc: false,
+    loginSortCol: "cpu_pct", loginSortAsc: false,
+    _loginProcs: [],
     filePath: "", fileSortCol: "name", fileSortAsc: true,
     editingFile: null, editDirty: false, uploadFiles: [],
     historyDuration: 3600,
@@ -58,6 +60,7 @@ document.addEventListener("DOMContentLoaded", function() {
             if (S.activeTab === "jobs") renderJobs();
             if (S.activeTab === "cluster") renderCluster();
             if (S.activeTab === "history") loadHistoryJobs();
+            if (S.activeTab === "loginnode") loadLoginNodeInfo();
         });
     });
     var dz = document.getElementById("dropZone");
@@ -79,6 +82,13 @@ document.addEventListener("DOMContentLoaded", function() {
                 S._pendingJobChartData = null;
             }
         });
+    }
+});
+
+/* 页面可见性变化时立即刷新 UI */
+document.addEventListener("visibilitychange", function() {
+    if (!document.hidden && S.data) {
+        try { updateUI(); } catch(e) {}
     }
 });
 
@@ -286,6 +296,10 @@ function connectWS() {
         S.ws.onopen = function() {
             S.wsConnected = true;
             setStatusBadge("success", "bi-wifi", "已连接");
+            // 连接后立即同步用户设置的刷新间隔到后端
+            if (S.refreshInterval) {
+                S.ws.send(JSON.stringify({type:"set_interval", value: S.refreshInterval}));
+            }
         };
         S.ws.onclose = function() {
             S.wsConnected = false;
@@ -294,7 +308,11 @@ function connectWS() {
         };
         S.ws.onerror = function() { S.wsConnected = false; };
         S.ws.onmessage = function(e) {
-            try { S.data = JSON.parse(e.data); updateUI(); } catch(err) { console.error("[WS updateUI]", err); }
+            try {
+                S.data = JSON.parse(e.data);
+                // 页面不可见时跳过 UI 更新，节省 CPU
+                if (!document.hidden) updateUI();
+            } catch(err) { console.error("[WS updateUI]", err); }
         };
     } catch(e) { S.wsConnected = false; }
 }
@@ -309,7 +327,13 @@ function setRefresh(v) {
     if (S.pollTimer) clearInterval(S.pollTimer);
     S.pollTimer = setInterval(function() { if (!S.wsConnected) fetchSnapshot(); }, val * 1000);
 }
-function manualRefresh() { fetchSnapshot(); }
+function manualRefresh() {
+    if (S.activeTab === "loginnode") {
+        loadLoginNodeInfo();
+        return;
+    }
+    fetchSnapshot();
+}
 
 /* ── 低功耗模式切换 ── */
 function togglePowerMode() {
@@ -383,9 +407,13 @@ function autoRefreshCharts() {
     }
     // 增量追加新数据点到任务图表（任务模态框打开时）
     var jobModal = document.getElementById("jobModal");
-    // 自动刷新日志输出（运行中任务，模态框打开时）
+    // 自动刷新日志输出（运行中任务，模态框打开时，限制频率：每5秒一次）
     if (S.currentJobId && jobModal && jobModal.classList.contains("show") && !S._jobIsFinished) {
-        try { loadJobLog(null, true); } catch(e) { console.error("[autoRefreshLog]", e); }
+        var now = Date.now();
+        if (!S._lastLogRefresh || now - S._lastLogRefresh > 5000) {
+            S._lastLogRefresh = now;
+            try { loadJobLog(null, true); } catch(e) { console.error("[autoRefreshLog]", e); }
+        }
     }
     if (S.currentJobId && jobModal && jobModal.classList.contains("show") && !S._jobIsFinished && !S._jobFullHistory) {
         // 如果 _jobModalChartData 为 null（初始加载中），尝试从 WS 数据直接初始化
@@ -1950,3 +1978,112 @@ function formatSize(bytes) {
 }
 function esc(s) { return s ? String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;") : ""; }
 function escAttr(s) { return s ? String(s).replace(/\\/g,"\\\\").replace(/'/g,"\'").replace(/"/g,"&quot;") : ""; }
+
+/* ===== 登录节点管理 ===== */
+function loadLoginNodeInfo() {
+    var tbody = document.getElementById("loginNodeProcesses");
+    if (tbody) tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted py-3"><div class="spinner-border spinner-border-sm me-2"></div>加载中...</td></tr>';
+    fetch("/api/login-node/info")
+        .then(function(r) {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+        })
+        .then(function(d) {
+            if (d.error) { showToast("获取失败: " + d.error); return; }
+            var load1 = Number(d.load_1 || 0);
+            var load5 = Number(d.load_5 || 0);
+            var load15 = Number(d.load_15 || 0);
+            var memTotal = Number(d.mem_total || 0);
+            var memUsed = Number(d.mem_used || 0);
+            var memFree = Number(d.mem_free || 0);
+            var memAvail = Number(d.mem_available || memFree || 0);
+            setText("loginNodeHostname", "🖥️ " + (d.hostname || "-"));
+            setText("loginNodeUptime", d.uptime || "");
+            setText("loginNodeOnline", "在线用户: " + (d.online_users || 0));
+            setText("loginNodeLoad", load1.toFixed(2) + " / " + load5.toFixed(2) + " / " + load15.toFixed(2));
+            setText("loginNodeCpus", d.cpus || "-");
+            var memPct = memTotal > 0 ? Math.round(memUsed / memTotal * 100) : 0;
+            setBar("loginNodeMemBar", memPct, formatSizeAuto(memUsed) + "/" + formatSizeAuto(memTotal) + " (" + memPct + "%)");
+            setText("loginNodeMemText", formatSizeAuto(memUsed) + " / " + formatSizeAuto(memTotal));
+            setText("loginNodeMemAvail", formatSizeAuto(memAvail));
+            S._loginProcs = Array.isArray(d.processes) ? d.processes : [];
+            renderLoginNodeProcesses();
+        })
+        .catch(function(e) {
+            showToast("获取登录节点信息失败: " + e);
+        });
+}
+
+function sortLoginProcs(col) {
+    if (S.loginSortCol === col) S.loginSortAsc = !S.loginSortAsc;
+    else { S.loginSortCol = col; S.loginSortAsc = (col === 'user' || col === 'state' || col === 'elapsed'); }
+    renderLoginNodeProcesses();
+}
+
+function renderLoginNodeProcesses() {
+    var procs = (S._loginProcs || []).slice();
+    var tbody = document.getElementById("loginNodeProcesses");
+    if (!tbody) return;
+    if (!procs.length) {
+        tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted py-3">无进程</td></tr>';
+        return;
+    }
+    var col = S.loginSortCol, asc = S.loginSortAsc;
+    procs.sort(function(a, b) {
+        var va, vb;
+        if (col === 'pid' || col === 'cpu_pct' || col === 'mem_pct' || col === 'rss_kb') {
+            va = Number(a[col]) || 0; vb = Number(b[col]) || 0;
+            return asc ? va - vb : vb - va;
+        }
+        va = String(a[col] || ''); vb = String(b[col] || '');
+        return asc ? va.localeCompare(vb) : vb.localeCompare(va);
+    });
+    var html = '';
+    procs.forEach(function(p) {
+        var rssKb = Number(p.rss_kb || 0);
+        var cpuPct = Number(p.cpu_pct || 0);
+        var memPct = Number(p.mem_pct || 0);
+        var cmd = String(p.cmd || "");
+        var rss = rssKb > 1048576 ? (rssKb / 1048576).toFixed(1) + "G" :
+                  rssKb > 1024 ? (rssKb / 1024).toFixed(1) + "M" : rssKb + "K";
+        var cpuCls = cpuPct > 50 ? 'text-danger fw-bold' : cpuPct > 10 ? 'text-warning' : '';
+        var cmdShort = cmd.length > 80 ? cmd.substring(0, 77) + '...' : cmd;
+        var userCls = p.user === S.clusterUsername ? 'text-info fw-bold' : '';
+        html += '<tr>';
+        html += '<td class="' + userCls + '">' + esc(p.user) + '</td>';
+        html += '<td>' + p.pid + '</td>';
+        html += '<td><span class="badge bg-' + procStateBadge(p.state) + '">' + p.state + '</span></td>';
+        html += '<td class="' + cpuCls + '">' + cpuPct.toFixed(1) + '</td>';
+        html += '<td>' + memPct.toFixed(1) + '</td>';
+        html += '<td>' + rss + '</td>';
+        html += '<td class="small">' + esc(p.elapsed) + '</td>';
+        html += '<td class="small" title="' + esc(cmd) + '" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(cmdShort) + '</td>';
+        html += '<td><button class="btn btn-sm btn-outline-danger py-0" onclick="killLoginProcess(' + p.pid + ')" title="终止进程"><i class="bi bi-x-circle"></i></button></td>';
+        html += '</tr>';
+    });
+    tbody.innerHTML = html;
+}
+
+function procStateBadge(state) {
+    if (state === 'R') return 'success';
+    if (state === 'S') return 'secondary';
+    if (state === 'D') return 'warning';
+    if (state === 'Z') return 'danger';
+    if (state === 'T') return 'info';
+    return 'secondary';
+}
+
+function killLoginProcess(pid) {
+    if (!confirm("确定终止进程 " + pid + " ？")) return;
+    fetch("/api/login-node/kill", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({pid: pid})
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+        showToast(d.message || (d.success ? "已终止" : "失败"));
+        if (d.success) setTimeout(loadLoginNodeInfo, 1000);
+    })
+    .catch(function(e) { alert("请求失败: " + e); });
+}

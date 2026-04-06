@@ -2,7 +2,7 @@
 # ============================================================
 #  SLURM Dashboard — One-Click Launcher
 #  Usage:
-#    bash launch.sh                         # Start on default port 8000
+#    bash launch.sh                         # Start on default port 8000 (password: change-me)
 #    bash launch.sh 9090                    # Use custom port
 #    bash launch.sh --password mypass       # Use custom password
 #    bash launch.sh 9090 --password mypass  # Custom port + password
@@ -19,8 +19,8 @@ LOG_FILE="$SCRIPT_DIR/server.log"
 CACHE_DIR="$SCRIPT_DIR/.cache"
 DEFAULT_PORT=8000
 DEFAULT_PASSWORD="change-me"
-CONDA_ENV=""
-CONDA_ACTIVATE=""
+CONDA_ENV="${DASHBOARD_CONDA_ENV:-}"
+CONDA_ACTIVATE="${DASHBOARD_CONDA_ACTIVATE:-}"
 
 # ── Colors ──
 RED='\033[0;31m'
@@ -39,38 +39,14 @@ banner() {
 }
 
 activate_conda() {
-    if python3 -c "import fastapi" 2>/dev/null; then
-        return
-    fi
-    if [[ -n "$CONDA_ENV" && -n "$CONDA_ACTIVATE" && -f "$CONDA_ACTIVATE" ]]; then
-        source "$CONDA_ACTIVATE" "$CONDA_ENV"
-        return
-    fi
-    if command -v conda &>/dev/null; then
-        conda activate 2>/dev/null || true
-        if python3 -c "import fastapi" 2>/dev/null; then
-            return
+    if [[ -n "$CONDA_ACTIVATE" && -n "$CONDA_ENV" ]]; then
+        if [[ -f "$CONDA_ACTIVATE" ]]; then
+            source "$CONDA_ACTIVATE" "$CONDA_ENV"
+        else
+            echo -e "${RED}[ERROR] Cannot find conda at $CONDA_ACTIVATE${NC}"
+            exit 1
         fi
     fi
-    for activate_path in \
-        "$HOME/miniconda3/bin/activate" \
-        "$HOME/anaconda3/bin/activate" \
-        "$HOME/miniforge3/bin/activate" \
-        "/opt/miniconda3/bin/activate" \
-        "/opt/miniforge/bin/activate"; do
-        if [[ -f "$activate_path" ]]; then
-            source "$activate_path" 2>/dev/null || true
-            if python3 -c "import fastapi" 2>/dev/null; then
-                return
-            fi
-        fi
-    done
-    echo -e "${RED}[ERROR] Cannot find Python with FastAPI.${NC}"
-    echo -e "${YELLOW}  Please either:${NC}"
-    echo -e "${YELLOW}  1. Activate your conda/venv before running this script${NC}"
-    echo -e "${YELLOW}  2. Set CONDA_ENV and CONDA_ACTIVATE variables at the top of this script${NC}"
-    echo -e "${YELLOW}  3. Install dependencies: pip install -r requirements.txt${NC}"
-    exit 1
 }
 
 is_running() {
