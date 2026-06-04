@@ -2,10 +2,21 @@
 import os
 import json
 import hashlib
+import secrets
+
+
+def _optional_int_env(name: str):
+    value = os.getenv(name, "").strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
 
 # Server
-HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
-PORT = int(os.getenv("DASHBOARD_PORT", "8089"))
+HOST = os.getenv("DASHBOARD_HOST", "127.0.0.1")
+PORT = _optional_int_env("DASHBOARD_PORT")
 
 # Refresh
 DEFAULT_REFRESH_INTERVAL = 10  # seconds
@@ -28,7 +39,9 @@ HISTORY_MAX_POINTS = 36000  # ~100 hours at 10s interval
 CLUSTER_NAME = os.getenv("DASHBOARD_CLUSTER_NAME", "SLURM HPC Cluster")
 
 # File browser
-FILE_BROWSER_ROOT = os.path.realpath(os.getenv("FILE_BROWSER_ROOT", os.path.expanduser("~")))
+FILE_BROWSER_ROOT = os.path.realpath(
+    os.getenv("DASHBOARD_FILE_BROWSER_ROOT", os.path.expanduser("~"))
+)
 
 # Log
 LOG_TAIL_LINES = 200
@@ -57,6 +70,9 @@ DEFAULT_USER_SETTINGS = {
     "historyTrackUsers": "",        # 需要追踪历史任务的用户名（逗号分隔）
     "clusterUsername": "",          # 本机集群用户名，用于实时采集 stdout/stderr
     "numaTrackEnabled": False,      # 是否记录 NUMA 内存分布趋势
+    "loginNodeDetailedCommands": False,  # 登录节点进程表是否显示完整命令行
+    "loginNodeExcludeRoot": True,   # 登录节点进程表是否默认隐藏 root 用户进程
+    "filePreviewZoomStep": 10,      # 文件预览缩放步进（百分比）
     "nodeVisibility": {},            # 节点显示/记录设置 {nodeName: {"show": true, "record": true}}
     "theme": "dark",                # UI theme (reserved)
 }
@@ -83,8 +99,18 @@ def save_user_settings(settings):
         return False
 
 # ── Access Control ──
-ACCESS_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "change-me")
-# Derive session secret deterministically from password (no extra storage needed)
-SESSION_SECRET = hashlib.sha256(
-    f"slurm-dashboard-v1-{ACCESS_PASSWORD}".encode()
-).hexdigest()
+ACCESS_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+# Derive session secret from a provided secret or password. When the password is
+# missing, keep imports working but fail runtime validation before serving.
+SESSION_SECRET = os.getenv("DASHBOARD_SESSION_SECRET") or (
+    hashlib.sha256(f"slurm-dashboard-v1-{ACCESS_PASSWORD}".encode()).hexdigest()
+    if ACCESS_PASSWORD else secrets.token_hex(32)
+)
+
+
+def validate_runtime_config():
+    """Validate settings required before serving real traffic."""
+    if not ACCESS_PASSWORD:
+        raise RuntimeError("DASHBOARD_PASSWORD must be set before starting the dashboard.")
+    if not FILE_BROWSER_ROOT:
+        raise RuntimeError("DASHBOARD_FILE_BROWSER_ROOT resolved to an empty path.")

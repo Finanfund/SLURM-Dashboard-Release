@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
-# ============================================================
-#  SLURM Dashboard — One-Click Launcher
-#  Usage:
-#    bash launch.sh                         # Start on default port 8000 (password: change-me)
-#    bash launch.sh 9090                    # Use custom port
-#    bash launch.sh --password mypass       # Use custom password
-#    bash launch.sh 9090 --password mypass  # Custom port + password
-#    bash launch.sh stop                    # Stop running server
-#    bash launch.sh restart                 # Restart server
-#    bash launch.sh status                  # Check server status
-# ============================================================
+# SLURM Dashboard launcher
+#
+# Usage:
+#   DASHBOARD_PASSWORD='change-me' bash launch.sh start 9000
+#   DASHBOARD_PASSWORD='change-me' DASHBOARD_PORT=9000 bash launch.sh start
+#   bash launch.sh stop
+#   bash launch.sh restart 9000
+#   bash launch.sh status
 
 set -euo pipefail
 
@@ -17,12 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PID_FILE="$SCRIPT_DIR/.dashboard.pid"
 LOG_FILE="$SCRIPT_DIR/server.log"
 CACHE_DIR="$SCRIPT_DIR/.cache"
-DEFAULT_PORT=8000
-DEFAULT_PASSWORD="change-me"
-CONDA_ENV="${DASHBOARD_CONDA_ENV:-}"
-CONDA_ACTIVATE="${DASHBOARD_CONDA_ACTIVATE:-}"
 
-# ── Colors ──
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -32,33 +24,95 @@ NC='\033[0m'
 
 banner() {
     echo -e "${CYAN}${BOLD}"
-    echo "  ╔══════════════════════════════════════════════════════╗"
-    echo "  ║          SLURM Dashboard — Task Manager             ║"
-    echo "  ╚══════════════════════════════════════════════════════╝"
+    echo "  SLURM Dashboard"
     echo -e "${NC}"
 }
 
-activate_conda() {
-    if [[ -n "$CONDA_ACTIVATE" && -n "$CONDA_ENV" ]]; then
-        if [[ -f "$CONDA_ACTIVATE" ]]; then
-            source "$CONDA_ACTIVATE" "$CONDA_ENV"
-        else
-            echo -e "${RED}[ERROR] Cannot find conda at $CONDA_ACTIVATE${NC}"
-            exit 1
-        fi
+die() {
+    echo -e "  ${RED}[ERROR] $*${NC}" >&2
+    exit 1
+}
+
+activate_python_env() {
+    if [[ -z "${DASHBOARD_CONDA_ENV:-}" ]]; then
+        return
     fi
+
+    local conda_base="${DASHBOARD_CONDA_BASE:-}"
+    if [[ -z "$conda_base" && -n "${CONDA_EXE:-}" ]]; then
+        conda_base="$(cd "$(dirname "$CONDA_EXE")/.." && pwd)"
+    fi
+    if [[ -z "$conda_base" ]] && command -v conda >/dev/null 2>&1; then
+        conda_base="$(conda info --base)"
+    fi
+    [[ -n "$conda_base" && -f "$conda_base/etc/profile.d/conda.sh" ]] || \
+        die "Cannot activate conda env; set DASHBOARD_CONDA_BASE or DASHBOARD_PYTHON."
+
+    # shellcheck disable=SC1090
+    source "$conda_base/etc/profile.d/conda.sh"
+    conda activate "$DASHBOARD_CONDA_ENV"
+}
+
+python_bin() {
+    echo "${DASHBOARD_PYTHON:-python3}"
+}
+
+check_python_deps() {
+    local py
+    py="$(python_bin)"
+    "$py" - <<'PY' || die "Missing dependencies. Run: pip install -r requirements.txt"
+import fastapi, uvicorn, jinja2, websockets, aiofiles, itsdangerous, multipart
+PY
 }
 
 is_running() {
     if [[ -f "$PID_FILE" ]]; then
         local pid
-        pid=$(cat "$PID_FILE")
-        if kill -0 "$pid" 2>/dev/null; then
+        pid="$(cat "$PID_FILE")"
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
             echo "$pid"
             return 0
-        else
-            rm -f "$PID_FILE"
         fi
+        rm -f "$PID_FILE"
+    fi
+    return 1
+}
+
+validate_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] || die "Port must be a number."
+    (( port > 0 && port <= 65535 )) || die "Port must be between 1 and 65535."
+}
+
+resolve_port() {
+    local port="${1:-${DASHBOARD_PORT:-}}"
+    if [[ -z "$port" && -t 0 ]]; then
+        read -r -p "  Port: " port
+    fi
+    [[ -n "$port" ]] || die "Port is required. Pass a port or set DASHBOARD_PORT."
+    validate_port "$port"
+    echo "$port"
+}
+
+resolve_password() {
+    local password="${CUSTOM_PASSWORD:-${DASHBOARD_PASSWORD:-}}"
+    if [[ -z "$password" && -t 0 ]]; then
+        read -r -s -p "  Access password: " password
+        echo
+    fi
+    [[ -n "$password" ]] || die "DASHBOARD_PASSWORD is required."
+    echo "$password"
+}
+
+port_in_use() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -tln 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$"
+        return
+    fi
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+        return
     fi
     return 1
 }
@@ -67,141 +121,88 @@ get_hostname() {
     hostname 2>/dev/null || echo "localhost"
 }
 
-get_public_ip() {
-    # Return first non-loopback IP
-    hostname -I 2>/dev/null | awk '{print $1}' || echo ""
-}
-
 wait_for_server() {
-    local port=$1
+    local port="$1"
     local max_wait=15
     local waited=0
     echo -ne "  ${YELLOW}Waiting for server to start...${NC}"
-    while [[ $waited -lt $max_wait ]]; do
-        if curl -s -o /dev/null -w "%{http_code}" "http://localhost:$port/login" 2>/dev/null | grep -q "200"; then
+    while [[ "$waited" -lt "$max_wait" ]]; do
+        if curl -fsS "http://127.0.0.1:$port/login" >/dev/null 2>&1; then
             echo -e " ${GREEN}Ready!${NC}"
             return 0
         fi
         echo -n "."
         sleep 1
-        ((waited++))
+        waited=$((waited + 1))
     done
     echo -e " ${RED}Timeout${NC}"
     return 1
 }
 
-do_start() {
-    local port=${1:-$DEFAULT_PORT}
-    local password="${DASHBOARD_PASSWORD:-$DEFAULT_PASSWORD}"
+print_access_info() {
+    local port="$1"
+    local host
+    host="$(get_hostname)"
 
-    # Check if already running
+    echo -e "  ${CYAN}${BOLD}Access${NC}"
+    echo -e "    Local:      ${BOLD}http://127.0.0.1:${port}${NC}"
+    echo -e "    SSH tunnel: ${BOLD}ssh -N -L ${port}:${host}:${port} <user>@<gateway>${NC}"
+    echo -e "    Browser:    ${BOLD}http://127.0.0.1:${port}${NC}"
+}
+
+do_start() {
+    local port
+    port="$(resolve_port "${1:-}")"
+    local password
+    password="$(resolve_password)"
+    local host="${DASHBOARD_HOST:-127.0.0.1}"
+
     local pid
-    if pid=$(is_running); then
+    if pid="$(is_running)"; then
         echo -e "  ${YELLOW}[!] Dashboard is already running (PID: $pid)${NC}"
-        echo -e "  ${YELLOW}    Use '${BOLD}bash launch.sh stop${NC}${YELLOW}' to stop, or '${BOLD}bash launch.sh restart${NC}${YELLOW}' to restart.${NC}"
-        echo ""
-        print_access_info "$port" "$password"
+        print_access_info "$port"
         return 0
     fi
 
-    # Activate conda
-    activate_conda
-
-    # Verify Python + FastAPI
-    if ! python3 -c "import fastapi" 2>/dev/null; then
-        echo -e "  ${RED}[ERROR] FastAPI not found. Run: pip install fastapi uvicorn${NC}"
-        exit 1
-    fi
-
-    # Verify itsdangerous (required by SessionMiddleware)
-    if ! python3 -c "import itsdangerous" 2>/dev/null; then
-        echo -e "  ${YELLOW}[!] itsdangerous not found, installing...${NC}"
-        pip install itsdangerous -q
-    fi
-
-        # Preserve historical cache and archived jobs across restarts
+    activate_python_env
+    check_python_deps
     mkdir -p "$CACHE_DIR"
 
-    # Check port availability
-    if ss -tlnp 2>/dev/null | grep -q ":$port "; then
-        echo -e "  ${RED}[ERROR] Port $port is already in use.${NC}"
-        echo -e "  ${YELLOW}  Try a different port: bash launch.sh <port>${NC}"
-        exit 1
+    if port_in_use "$port"; then
+        die "Port $port is already in use."
     fi
 
-    # Start server in background, pass password via environment variable
     cd "$SCRIPT_DIR"
-    DASHBOARD_PASSWORD="$password" nohup python3 app.py --host 0.0.0.0 --port "$port" >> "$LOG_FILE" 2>&1 &
+    local py
+    py="$(python_bin)"
+    DASHBOARD_PASSWORD="$password" DASHBOARD_PORT="$port" DASHBOARD_HOST="$host" \
+        nohup "$py" app.py --host "$host" --port "$port" >> "$LOG_FILE" 2>&1 &
     local server_pid=$!
     echo "$server_pid" > "$PID_FILE"
 
-    echo -e "  ${CYAN}[*] Access password: ${BOLD}${password}${NC}"
-    echo ""
-
-    # Wait for server to be ready
     if ! wait_for_server "$port"; then
         echo -e "  ${RED}[ERROR] Server failed to start. Check log: $LOG_FILE${NC}"
-        tail -5 "$LOG_FILE" 2>/dev/null
+        tail -20 "$LOG_FILE" 2>/dev/null || true
         rm -f "$PID_FILE"
         exit 1
     fi
 
-    echo -e "  ${GREEN}${BOLD}[OK] Dashboard started successfully!${NC}"
+    echo -e "  ${GREEN}${BOLD}[OK] Dashboard started.${NC}"
     echo -e "  ${GREEN}  PID:  $server_pid${NC}"
     echo -e "  ${GREEN}  Port: $port${NC}"
+    echo -e "  ${GREEN}  Host: $host${NC}"
     echo -e "  ${GREEN}  Log:  $LOG_FILE${NC}"
-    echo ""
-    print_access_info "$port" "$password"
-}
-
-print_access_info() {
-    local port=$1
-    local password="${2:-$DEFAULT_PASSWORD}"
-    local hn
-    hn=$(get_hostname)
-    local ip
-    ip=$(get_public_ip)
-
-    echo -e "  ${CYAN}${BOLD}── Access Information ──${NC}"
-    echo ""
-    echo -e "  ${YELLOW}${BOLD}🔑 Password: ${password}${NC}"
-    echo ""
-
-    # Internal cluster access
-    if [[ -n "$ip" ]]; then
-        echo -e "  ${GREEN}${BOLD}▸ Cluster Internal (direct):${NC}"
-        echo -e "    ${BOLD}http://${ip}:${port}${NC}"
-        echo ""
-    fi
-
-    # SSH tunnel access
-    echo -e "  ${GREEN}${BOLD}▸ Remote Access (SSH tunnel):${NC}"
-    echo -e "    ${YELLOW}Step 1: Run on your ${BOLD}local machine${NC}${YELLOW}:${NC}"
-    echo -e "    ${BOLD}ssh -N -L ${port}:${hn}:${port} <user>@<gateway>${NC}"
-    echo ""
-    echo -e "    ${YELLOW}Step 2: Open in browser:${NC}"
-    echo -e "    ${BOLD}http://localhost:${port}${NC}"
-    echo ""
-
-    # Direct node access (if public IP)
-    if [[ -n "$ip" && "$ip" != "192.168"* && "$ip" != "172.16"* && "$ip" != "10."* ]]; then
-        echo -e "  ${GREEN}${BOLD}▸ Direct Access (if firewall allows):${NC}"
-        echo -e "    ${BOLD}http://${ip}:${port}${NC}"
-        echo ""
-    fi
-
-    echo -e "  ${CYAN}──────────────────────────────${NC}"
+    print_access_info "$port"
 }
 
 do_stop() {
     local pid
-    if pid=$(is_running); then
-        kill "$pid" 2>/dev/null
+    if pid="$(is_running)"; then
+        kill "$pid" 2>/dev/null || true
         rm -f "$PID_FILE"
         sleep 1
         if kill -0 "$pid" 2>/dev/null; then
-            echo -e "  ${YELLOW}[*] Graceful stop timed out, force killing...${NC}"
-            kill -9 "$pid" 2>/dev/null
+            kill -9 "$pid" 2>/dev/null || true
         fi
         echo -e "  ${GREEN}[OK] Dashboard stopped (PID: $pid)${NC}"
     else
@@ -211,44 +212,62 @@ do_stop() {
 
 do_status() {
     local pid
-    if pid=$(is_running); then
+    if pid="$(is_running)"; then
         echo -e "  ${GREEN}[RUNNING] Dashboard is active (PID: $pid)${NC}"
-        local port
-        port=$(ss -tlnp 2>/dev/null | grep "pid=$pid" | awk '{print $4}' | grep -oP ':\K[0-9]+' | head -1)
-        if [[ -n "$port" ]]; then
-            echo -e "  ${GREEN}  Port: $port${NC}"
-            print_access_info "$port"
-        else
-            echo -e "  ${YELLOW}  Port: (checking...)${NC}"
-            print_access_info "$DEFAULT_PORT"
-        fi
     else
         echo -e "  ${YELLOW}[STOPPED] Dashboard is not running.${NC}"
-        echo -e "  ${YELLOW}  Start with: bash launch.sh${NC}"
     fi
 }
 
 do_restart() {
-    local port=${1:-$DEFAULT_PORT}
-    echo -e "  ${YELLOW}[*] Restarting dashboard...${NC}"
+    local port="${1:-}"
+    echo -e "  ${YELLOW}Restarting dashboard...${NC}"
     do_stop
-    sleep 1
     do_start "$port"
 }
 
-# ── Parse --password / -p arguments before the main case ──
+usage() {
+    cat <<'EOF'
+Usage:
+  DASHBOARD_PASSWORD='change-me' bash launch.sh start <port>
+  DASHBOARD_PASSWORD='change-me' DASHBOARD_PORT=<port> bash launch.sh start
+  bash launch.sh stop
+  bash launch.sh restart <port>
+  bash launch.sh status
+
+Options:
+  --password, -p <value>       Set access password for this launch.
+
+Environment:
+  DASHBOARD_PASSWORD           Required access password.
+  DASHBOARD_PORT               Port to listen on when no port argument is given.
+  DASHBOARD_HOST               Bind host, defaults to 127.0.0.1.
+  DASHBOARD_FILE_BROWSER_ROOT  Writable file browser root, defaults to $HOME.
+  DASHBOARD_PYTHON             Python executable, defaults to python3.
+  DASHBOARD_CONDA_ENV          Optional conda environment name/path to activate.
+  DASHBOARD_CONDA_BASE         Optional conda base path when conda is not on PATH.
+EOF
+}
+
+COMMAND="${1:-start}"
+if [[ $# -gt 0 ]]; then
+    shift
+fi
+PORT_ARG=""
 CUSTOM_PASSWORD=""
 POSITIONAL_ARGS=()
+
+if [[ "$COMMAND" =~ ^[0-9]+$ ]]; then
+    PORT_ARG="$COMMAND"
+    COMMAND="start"
+fi
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --password|-p)
-            if [[ -n "${2:-}" && "$2" != --* ]]; then
-                CUSTOM_PASSWORD="$2"
-                shift 2
-            else
-                echo -e "${RED}[ERROR] --password requires a value${NC}"
-                exit 1
-            fi
+            [[ -n "${2:-}" && "$2" != --* ]] || die "--password requires a value"
+            CUSTOM_PASSWORD="$2"
+            shift 2
             ;;
         --password=*)
             CUSTOM_PASSWORD="${1#--password=}"
@@ -260,59 +279,29 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
-# Restore positional parameters
-set -- "${POSITIONAL_ARGS[@]:-}"
 
-# Export password so child processes inherit it
-if [[ -n "$CUSTOM_PASSWORD" ]]; then
-    export DASHBOARD_PASSWORD="$CUSTOM_PASSWORD"
+if [[ -z "$PORT_ARG" && ${#POSITIONAL_ARGS[@]} -gt 0 ]]; then
+    PORT_ARG="${POSITIONAL_ARGS[0]}"
 fi
 
-# ── Main ──
 banner
-
-case "${1:-start}" in
+case "$COMMAND" in
+    start)
+        do_start "$PORT_ARG"
+        ;;
     stop)
         do_stop
+        ;;
+    restart)
+        do_restart "$PORT_ARG"
         ;;
     status)
         do_status
         ;;
-    restart)
-        do_restart "${2:-$DEFAULT_PORT}"
-        ;;
-    start)
-        do_start "${2:-$DEFAULT_PORT}"
-        ;;
-    [0-9]*)
-        # bare port number: bash launch.sh 9090
-        do_start "$1"
-        ;;
     -h|--help|help)
-        echo "  Usage: bash launch.sh [start|stop|restart|status|<port>] [--password <pass>]"
-        echo ""
-        echo "  Commands:"
-        echo "    start [port]    Start dashboard (default port: $DEFAULT_PORT)"
-        echo "    stop            Stop running dashboard"
-        echo "    restart [port]  Restart dashboard"
-        echo "    status          Check if dashboard is running"
-        echo "    <port>          Start on specified port"
-        echo ""
-        echo "  Options:"
-        echo "    --password, -p <pass>   Set access password (default: $DEFAULT_PASSWORD)"
-        echo "                            Can also set via env: DASHBOARD_PASSWORD=xxx bash launch.sh"
-        echo ""
-        echo "  Examples:"
-        echo "    bash launch.sh                           # port=$DEFAULT_PORT, password=$DEFAULT_PASSWORD"
-        echo "    bash launch.sh 9090                      # port=9090"
-        echo "    bash launch.sh --password secret         # custom password"
-        echo "    bash launch.sh 9090 --password secret    # custom port + password"
-        echo "    DASHBOARD_PASSWORD=secret bash launch.sh # via environment variable"
-        echo ""
+        usage
         ;;
     *)
-        echo -e "  ${RED}Unknown command: $1${NC}"
-        echo "  Usage: bash launch.sh [start|stop|restart|status|<port>] [--password <pass>]"
-        exit 1
+        die "Unknown command: $COMMAND"
         ;;
 esac

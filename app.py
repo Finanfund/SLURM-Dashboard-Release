@@ -5,6 +5,7 @@ SLURM Dashboard - FastAPI Application
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import signal
 import shutil
@@ -38,6 +39,24 @@ refresh_interval: int = config.DEFAULT_REFRESH_INTERVAL
 # 注意: Semaphore 必须在事件循环内创建，否则 Python 3.9 会报 "attached to a different loop"
 _collect_semaphore = None  # 在 lifespan 中初始化
 
+
+def _clamp_refresh_interval(val: int) -> int:
+    return max(config.MIN_REFRESH_INTERVAL, min(config.MAX_REFRESH_INTERVAL, int(val)))
+
+
+def _get_server_refresh_interval() -> int:
+    """Server-side collection cadence; do not let websocket clients override it."""
+    settings = collector._load_user_settings_cached()
+    return _clamp_refresh_interval(settings.get("refreshIntervalSec", config.DEFAULT_REFRESH_INTERVAL))
+
+
+async def _safe_send_ws(ws: WebSocket, msg: str, timeout: float = 0.8) -> bool:
+    try:
+        await asyncio.wait_for(ws.send_text(msg), timeout=timeout)
+        return True
+    except Exception:
+        return False
+
 async def collect_and_broadcast():
     """单次采集并广播结果"""
     async with _collect_semaphore:
@@ -56,15 +75,23 @@ async def collect_and_broadcast():
             data["_collect_time_ms"] = round(elapsed * 1000)
             data["_server_paused"] = collector.paused
             msg = json.dumps(data, ensure_ascii=False)
+            clients = list(ws_clients)
+            t_send0 = time.time()
+            send_results = await asyncio.gather(
+                *[_safe_send_ws(ws, msg) for ws in clients],
+                return_exceptions=True
+            )
             stale = []
-            for ws in ws_clients:
-                try:
-                    await ws.send_text(msg)
-                except Exception:
+            for ws, ok in zip(clients, send_results):
+                if ok is not True:
                     stale.append(ws)
             for ws in stale:
                 if ws in ws_clients:
                     ws_clients.remove(ws)
+            send_elapsed_ms = round((time.time() - t_send0) * 1000)
+            if stale or send_elapsed_ms > 400:
+                logger.info(f"WS broadcast {len(clients)-len(stale)}/{len(clients)} ok, "
+                            f"stale={len(stale)}, send_ms={send_elapsed_ms}")
         except Exception as e:
             logger.error(f"collect_and_broadcast error: {e}", exc_info=True)
 
@@ -80,6 +107,7 @@ async def background_collector():
             break
         except Exception as e:
             logger.error(f"Collection schedule error: {e}", exc_info=True)
+        refresh_interval = _get_server_refresh_interval()
         # 自适应降频：连续全缓存时临时增大间隔，避免SSH通道饱和
         effective_interval = refresh_interval
         if hasattr(collector, '_consecutive_all_cached') and collector._consecutive_all_cached >= 5:
@@ -90,8 +118,9 @@ async def background_collector():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bg_task, _collect_semaphore
+    config.validate_runtime_config()
     _collect_semaphore = asyncio.Semaphore(1)  # 串行采集，避免并发SSH竞争
-    logger.info(f"Starting SLURM Dashboard on {config.HOST}:{config.PORT}")
+    logger.info(f"Starting SLURM Dashboard on {config.HOST}")
     bg_task = asyncio.create_task(background_collector())
     yield
     bg_task.cancel()
@@ -102,7 +131,7 @@ async def lifespan(app: FastAPI):
     # 关闭前保存缓存和归档，确保不丢失历史数据
     try:
         collector._save_cache()
-        collector._save_archived_jobs()
+        collector._save_archived_jobs(force=True)
         logger.info("Shutdown: cache and archived jobs saved successfully")
     except Exception as e:
         logger.error(f"Shutdown save error: {e}")
@@ -113,6 +142,62 @@ app = FastAPI(title="SLURM Dashboard", lifespan=lifespan)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+FILE_BROWSER_ROOT_REAL = os.path.realpath(config.FILE_BROWSER_ROOT)
+
+
+def render_template(request: Request, name: str, context: dict, status_code: int = 200):
+    """Render templates across Starlette TemplateResponse signature variants."""
+    payload = {"request": request}
+    payload.update(context)
+    try:
+        return templates.TemplateResponse(request, name, payload, status_code=status_code)
+    except TypeError:
+        return templates.TemplateResponse(name, payload, status_code=status_code)
+
+
+async def _run_io(func, *args):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(collector._io_executor, func, *args)
+
+
+async def _realpath(path: str) -> str:
+    return await _run_io(os.path.realpath, path)
+
+
+async def _isfile(path: str) -> bool:
+    return await _run_io(os.path.isfile, path)
+
+
+async def _isdir(path: str) -> bool:
+    return await _run_io(os.path.isdir, path)
+
+
+async def _access(path: str, mode: int) -> bool:
+    return await _run_io(os.access, path, mode)
+
+
+async def _getsize(path: str) -> int:
+    return await _run_io(os.path.getsize, path)
+
+
+def _within_file_browser_root(path: str) -> bool:
+    try:
+        return os.path.commonpath([FILE_BROWSER_ROOT_REAL, path]) == FILE_BROWSER_ROOT_REAL
+    except ValueError:
+        return False
+
+
+async def _can_read_path(path: str) -> bool:
+    if await _isdir(path):
+        return await _access(path, os.R_OK | os.X_OK)
+    return await _access(path, os.R_OK)
+
+
+async def _save_user_settings_async(settings: dict) -> bool:
+    ok = await _run_io(config.save_user_settings, settings)
+    if ok:
+        collector.update_user_settings_cache(settings)
+    return ok
 
 
 # ── Auth Middleware ──
@@ -147,8 +232,7 @@ app.add_middleware(SessionMiddleware, secret_key=config.SESSION_SECRET, max_age=
 # ── Login / Logout ──
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request, next: str = "/"):
-    return templates.TemplateResponse("login.html", {
-        "request": request,
+    return render_template(request, "login.html", {
         "next": next,
         "cluster_name": config.CLUSTER_NAME,
         "error": None,
@@ -164,8 +248,7 @@ async def login_submit(request: Request, next: str = "/"):
         logger.info(f"Successful login from {request.client.host}")
         return RedirectResponse(next if next else "/", status_code=303)
     logger.warning(f"Failed login attempt from {request.client.host}")
-    return templates.TemplateResponse("login.html", {
-        "request": request,
+    return render_template(request, "login.html", {
         "next": next,
         "cluster_name": config.CLUSTER_NAME,
         "error": "密码错误，请重试。",
@@ -181,9 +264,10 @@ async def logout(request: Request):
 # ── Pages ──
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {
-        "request": request, "cluster_name": config.CLUSTER_NAME,
-        "refresh_interval": refresh_interval, "user_settings": config.load_user_settings(),
+    return render_template(request, "index.html", {
+        "cluster_name": config.CLUSTER_NAME,
+        "refresh_interval": refresh_interval, "user_settings": collector._load_user_settings_cached(),
+        "file_browser_root": config.FILE_BROWSER_ROOT,
     })
 
 
@@ -208,10 +292,9 @@ async def websocket_endpoint(ws: WebSocket):
             try:
                 cmd = json.loads(msg)
                 if cmd.get("type") == "set_interval":
-                    global refresh_interval
                     val = int(cmd.get("value", config.DEFAULT_REFRESH_INTERVAL))
-                    refresh_interval = max(config.MIN_REFRESH_INTERVAL, min(config.MAX_REFRESH_INTERVAL, val))
-                    logger.info(f"Refresh interval: {refresh_interval}s")
+                    client_val = _clamp_refresh_interval(val)
+                    logger.debug(f"Client requested ws interval={client_val}s (server cadence unchanged)")
             except (json.JSONDecodeError, ValueError):
                 pass
     except WebSocketDisconnect:
@@ -235,7 +318,7 @@ async def server_resume():
 
 @app.get("/api/server/status")
 async def server_status():
-    return {"paused": collector.paused, "refresh_interval": refresh_interval, "user_settings": config.load_user_settings(),
+    return {"paused": collector.paused, "refresh_interval": refresh_interval, "user_settings": collector._load_user_settings_cached(),
             "clients": len(ws_clients)}
 
 @app.post("/api/server/stop")
@@ -308,22 +391,42 @@ async def api_list_files(path: str = Query(default=""),
                          folder_sizes: int = Query(default=0)):
     if not path or not path.strip():
         path = config.FILE_BROWSER_ROOT
-    path = os.path.realpath(path)
-    if not path.startswith(config.FILE_BROWSER_ROOT):
+    path = await _realpath(path)
+    if not await _isdir(path):
+        return JSONResponse(status_code=404, content={"error": "目录不存在"})
+    if not await _can_read_path(path):
         return JSONResponse(status_code=403, content={"error": "Access denied"})
     entries = await collector.list_directory(path, compute_dir_sizes=bool(folder_sizes))
-    return {"path": path, "entries": entries}
+    return {"path": path, "entries": entries, "allow_write": _within_file_browser_root(path)}
+
+
+@app.get("/api/file-tree")
+async def api_file_tree(path: str = Query(default="/"),
+                        limit: int = Query(default=500, ge=1, le=2000)):
+    """只读目录树：从 / 开始展开目录，不改变右侧文件操作的安全范围。"""
+    path = path if path and path.strip() else "/"
+    path = await _realpath(path)
+    if not await _isdir(path):
+        return JSONResponse(status_code=404, content={"error": "目录不存在", "path": path})
+    if not await _can_read_path(path):
+        return JSONResponse(status_code=403, content={"error": "Access denied", "path": path})
+    result = await collector.list_directory_tree(path, limit=limit)
+    result["can_read"] = True
+    return JSONResponse(content=result, headers={"Content-Type": "application/json; charset=utf-8"})
+
 
 @app.get("/api/file-content")
 async def api_file_content(path: str = Query(default="")):
     if not path or not path.strip():
         return JSONResponse(status_code=400, content={"error": "No path"})
-    path = os.path.realpath(path)
-    if not path.startswith(config.FILE_BROWSER_ROOT):
+    path = await _realpath(path)
+    if not await _isfile(path):
+        return JSONResponse(status_code=404, content={"error": "File not found"})
+    if not await _can_read_path(path):
         return JSONResponse(status_code=403, content={"error": "Access denied"})
     content = await collector.read_file_content(path, max_size=config.MAX_EDIT_FILE_SIZE)
     if content is not None:
-        return {"path": path, "content": content, "size": os.path.getsize(path)}
+        return {"path": path, "content": content, "size": await _getsize(path)}
     return JSONResponse(status_code=404, content={"error": "Cannot read file"})
 
 @app.post("/api/file-save")
@@ -333,11 +436,12 @@ async def api_file_save(request: Request):
     content = body.get("content", "")
     if not path:
         return JSONResponse(status_code=400, content={"error": "No path"})
-    path = os.path.realpath(path)
-    if not path.startswith(config.FILE_BROWSER_ROOT):
+    path = await _realpath(path)
+    if not _within_file_browser_root(path):
         return JSONResponse(status_code=403, content={"error": "Access denied"})
     result = await collector.save_file_content(path, content)
     if result["success"]:
+        collector.invalidate_directory_cache(os.path.dirname(path))
         return {"status": "ok", "message": result["message"]}
     return JSONResponse(status_code=500, content={"error": result["message"]})
 
@@ -345,23 +449,42 @@ async def api_file_save(request: Request):
 async def api_file_download(path: str = Query(default="")):
     if not path:
         return JSONResponse(status_code=400, content={"error": "No path"})
-    path = os.path.realpath(path)
-    if not path.startswith(config.FILE_BROWSER_ROOT):
-        return JSONResponse(status_code=403, content={"error": "Access denied"})
-    if not os.path.isfile(path):
+    path = await _realpath(path)
+    if not await _isfile(path):
         return JSONResponse(status_code=404, content={"error": "File not found"})
+    if not await _can_read_path(path):
+        return JSONResponse(status_code=403, content={"error": "Access denied"})
     return FileResponse(path, filename=os.path.basename(path))
+
+
+@app.get("/api/file-preview")
+async def api_file_preview(path: str = Query(default="")):
+    """Inline, read-only file response for browser previews."""
+    if not path:
+        return JSONResponse(status_code=400, content={"error": "No path"})
+    path = await _realpath(path)
+    if not await _isfile(path):
+        return JSONResponse(status_code=404, content={"error": "File not found"})
+    if not await _can_read_path(path):
+        return JSONResponse(status_code=403, content={"error": "Access denied"})
+    media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    return FileResponse(
+        path,
+        filename=os.path.basename(path),
+        media_type=media_type,
+        content_disposition_type="inline",
+    )
 
 @app.get("/api/folder-download")
 async def api_folder_download(path: str = Query(default="")):
     """将文件夹打包为zip并下载"""
     if not path:
         return JSONResponse(status_code=400, content={"error": "未提供路径"})
-    path = os.path.realpath(path)
-    if not path.startswith(config.FILE_BROWSER_ROOT):
-        return JSONResponse(status_code=403, content={"error": "访问被拒绝"})
-    if not os.path.isdir(path):
+    path = await _realpath(path)
+    if not await _isdir(path):
         return JSONResponse(status_code=404, content={"error": "文件夹不存在"})
+    if not await _can_read_path(path):
+        return JSONResponse(status_code=403, content={"error": "访问被拒绝"})
     folder_name = os.path.basename(path)
     # 在临时目录创建zip文件
     tmp_dir = tempfile.mkdtemp()
@@ -394,20 +517,30 @@ def _create_zip(folder_path: str, zip_path: str):
                 except (PermissionError, OSError):
                     pass  # 跳过无法读取的文件
 
+
+def _write_binary_file_sync(path: str, content: bytes):
+    with open(path, "wb") as f:
+        f.write(content)
+
+
+def _makedirs_sync(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
 @app.post("/api/file-upload")
 async def api_file_upload(file: UploadFile = File(...), dest: str = Form(...)):
     if not dest:
         return JSONResponse(status_code=400, content={"error": "No destination"})
-    dest = os.path.realpath(dest)
-    if not dest.startswith(config.FILE_BROWSER_ROOT):
+    dest = await _realpath(dest)
+    if not _within_file_browser_root(dest):
         return JSONResponse(status_code=403, content={"error": "Access denied"})
-    target = os.path.join(dest, file.filename) if os.path.isdir(dest) else dest
+    target = os.path.join(dest, file.filename) if await _isdir(dest) else dest
     try:
         content = await file.read()
         if len(content) > config.MAX_UPLOAD_SIZE:
             return JSONResponse(status_code=413, content={"error": "File too large"})
-        with open(target, "wb") as f:
-            f.write(content)
+        await _run_io(_write_binary_file_sync, target, content)
+        collector.invalidate_directory_cache(dest)
         return {"status": "ok", "path": target, "size": len(content)}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -418,16 +551,17 @@ async def api_file_delete(request: Request):
     path = body.get("path", "")
     if not path:
         return JSONResponse(status_code=400, content={"error": "No path"})
-    path = os.path.realpath(path)
-    if not path.startswith(config.FILE_BROWSER_ROOT):
+    path = await _realpath(path)
+    if not _within_file_browser_root(path):
         return JSONResponse(status_code=403, content={"error": "Access denied"})
     try:
-        if os.path.isdir(path):
-            shutil.rmtree(path)
-        elif os.path.exists(path):
-            os.remove(path)
+        if await _isdir(path):
+            await _run_io(shutil.rmtree, path)
+        elif await _run_io(os.path.exists, path):
+            await _run_io(os.remove, path)
         else:
             return JSONResponse(status_code=404, content={"error": "Not found"})
+        collector.invalidate_directory_cache(os.path.dirname(path))
         return {"status": "ok"}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -438,11 +572,12 @@ async def api_file_mkdir(request: Request):
     path = body.get("path", "")
     if not path:
         return JSONResponse(status_code=400, content={"error": "No path"})
-    path = os.path.realpath(path)
-    if not path.startswith(config.FILE_BROWSER_ROOT):
+    path = await _realpath(path)
+    if not _within_file_browser_root(path):
         return JSONResponse(status_code=403, content={"error": "Access denied"})
     try:
-        os.makedirs(path, exist_ok=True)
+        await _run_io(_makedirs_sync, path)
+        collector.invalidate_directory_cache(os.path.dirname(path))
         return {"status": "ok", "path": path}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -451,22 +586,18 @@ async def api_file_mkdir(request: Request):
 # ── User Settings API ──
 @app.get("/api/settings")
 async def api_get_settings():
-    return config.load_user_settings()
+    return collector._load_user_settings_cached()
 
 @app.post("/api/settings")
 async def api_save_settings(request: Request):
     body = await request.json()
-    current = config.load_user_settings()
+    current = collector._load_user_settings_cached()
     # Only update known keys
     for k in config.DEFAULT_USER_SETTINGS:
         if k in body:
             current[k] = body[k]
-    # Apply refresh interval immediately
-    if "refreshIntervalSec" in body:
-        global refresh_interval
-        val = int(body["refreshIntervalSec"])
-        refresh_interval = max(config.MIN_REFRESH_INTERVAL, min(config.MAX_REFRESH_INTERVAL, val))
-    ok = config.save_user_settings(current)
+    # Keep using server-side settings as source of truth; next collector tick will pick it up.
+    ok = await _save_user_settings_async(current)
     return {"status": "ok" if ok else "error", "settings": current}
 
 
@@ -478,10 +609,10 @@ async def api_sbatch(request: Request):
     path = body.get("path", "")
     if not path:
         return JSONResponse(status_code=400, content={"error": "未提供文件路径"})
-    path = os.path.realpath(path)
-    if not path.startswith(config.FILE_BROWSER_ROOT):
+    path = await _realpath(path)
+    if not _within_file_browser_root(path):
         return JSONResponse(status_code=403, content={"error": "访问被拒绝"})
-    if not os.path.isfile(path):
+    if not await _isfile(path):
         return JSONResponse(status_code=404, content={"error": "文件不存在"})
     result = await collector.submit_sbatch(path)
     return JSONResponse(content=result)
@@ -495,10 +626,10 @@ async def api_bash(request: Request):
     path = body.get("path", "")
     if not path:
         return JSONResponse(status_code=400, content={"error": "未提供文件路径"})
-    path = os.path.realpath(path)
-    if not path.startswith(config.FILE_BROWSER_ROOT):
+    path = await _realpath(path)
+    if not _within_file_browser_root(path):
         return JSONResponse(status_code=403, content={"error": "访问被拒绝"})
-    if not os.path.isfile(path):
+    if not await _isfile(path):
         return JSONResponse(status_code=404, content={"error": "文件不存在"})
     result = await collector.run_bash(path)
     return JSONResponse(content=result)
@@ -508,7 +639,7 @@ async def api_bash(request: Request):
 @app.get("/api/bookmarks")
 async def api_get_bookmarks():
     """获取收藏列表"""
-    settings = config.load_user_settings()
+    settings = collector._load_user_settings_cached()
     return {"bookmarks": settings.get("bookmarks", [])}
 
 @app.post("/api/bookmarks")
@@ -516,9 +647,9 @@ async def api_save_bookmarks(request: Request):
     """保存收藏列表"""
     body = await request.json()
     bookmarks = body.get("bookmarks", [])
-    settings = config.load_user_settings()
+    settings = collector._load_user_settings_cached()
     settings["bookmarks"] = bookmarks
-    ok = config.save_user_settings(settings)
+    ok = await _save_user_settings_async(settings)
     return {"status": "ok" if ok else "error", "bookmarks": bookmarks}
 
 
@@ -544,9 +675,17 @@ async def api_disk_info(path: str = Query(default="")):
 
 # ── 登录节点管理 ──
 @app.get("/api/login-node/info")
-async def api_login_node_info():
+async def api_login_node_info(sort: str = Query(default="cpu_pct"),
+                              limit: int = Query(default=50),
+                              detail: int = Query(default=-1),
+                              exclude_root: int = Query(default=-1)):
     """获取登录节点系统信息和用户进程列表"""
-    result = await collector.get_login_node_info()
+    detailed_commands = None if detail < 0 else bool(detail)
+    exclude_root_users = None if exclude_root < 0 else bool(exclude_root)
+    result = await collector.get_login_node_info(
+        sort_by=sort, limit=limit, detailed_commands=detailed_commands,
+        exclude_root=exclude_root_users
+    )
     return JSONResponse(content=result, headers={"Content-Type": "application/json; charset=utf-8"})
 
 @app.post("/api/login-node/kill")
@@ -567,4 +706,7 @@ if __name__ == "__main__":
     parser.add_argument("--host", default=config.HOST)
     parser.add_argument("--port", type=int, default=config.PORT)
     args = parser.parse_args()
+    if args.port is None:
+        parser.error("--port is required unless DASHBOARD_PORT is set")
+    config.validate_runtime_config()
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

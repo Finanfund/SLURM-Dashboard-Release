@@ -8,9 +8,20 @@ var S = {
     jobSortCol: "job_id", jobSortAsc: true, jobFilter: "all",
     historySortCol: "job_id", historySortAsc: false,
     loginSortCol: "cpu_pct", loginSortAsc: false,
+    loginProcessSort: "cpu_pct", loginProcessLimit: 50,
+    loginDetailedCommands: false,
+    loginExcludeRoot: true,
+    loginProcessSearch: "",
     _loginProcs: [],
     filePath: "", fileSortCol: "name", fileSortAsc: true,
-    editingFile: null, editDirty: false, uploadFiles: [],
+    editingFile: null, editorMode: null, editDirty: false, uploadFiles: [],
+    fileBrowserRoot: "",
+    fileLayoutMode: "list",
+    fileAllowWrite: true,
+    showHiddenFiles: true,
+    fileColumnAutoWidth: false,
+    fileColumns: {name: true, size: true, mtime: true, owner: true, perm: true, ext: true, actions: true},
+    fileColumnWidths: {name: 420, size: 110, mtime: 180, owner: 120, perm: 130, ext: 110, actions: 150},
     historyDuration: 3600,
     refreshInterval: 10,
     charts: {},
@@ -18,6 +29,10 @@ var S = {
     pollTimer: null, wsConnected: false,
     showFolderSizes: false,
     fileViewMode: "full",
+    filePreviewFullscreenDefault: false,
+    previewKind: null,
+    previewZoom: 1,
+    previewZoomStep: 10,
     expandedPartitions: {},
     showJobCurves: false,
     maxCacheMB: 100,
@@ -47,11 +62,35 @@ var S = {
     _jobMemNumaMode: false,  // 跟踪当前内存图表是否为 NUMA 堆叠模式
     _nodeVisibility: {},     // 节点显示/记录设置
     _splitterDragging: false,
-    _hasCopied: false        // 是否有复制内容
+    _fileTreeDragging: false,
+    _fileColumnResize: null,
+    _suppressFileSortUntil: 0,
+    _fileAutoFitSignature: "",
+    _hasCopied: false,       // 是否有复制内容
+    filesFilterText: "",     // 文件浏览筛选关键词（绑定当前目录）
+    _filesFilterByPath: {},   // path -> filter text
+    _fileTreeChildren: {},
+    _fileTreeExpanded: {"/": true},
+    _fileTreeLoading: {},
+    _fileTreeTruncated: {},
+    _fileTreeReadable: {"/": true},
+    _fileTreeClickTimer: null,
+    _fileTreeWidth: 280,
+    _fileNavBack: [],
+    _fileNavForward: [],
+    _fileNavSuppress: false,
+    _filesFilterTimer: null,
+    _filePreviewSeq: 0,
+    _previewToastTimer: null,
+    _retainDateListenerBound: false,
+    _jobsLastRenderAt: 0,
+    _jobsLastSig: ""
 };
 
 /* ── Init ── */
 document.addEventListener("DOMContentLoaded", function() {
+    S.fileBrowserRoot = window.FILE_BROWSER_ROOT || S.fileBrowserRoot || "";
+    loadFileBrowserUiPrefs();
     loadSettingsFromServer();
     fetchSnapshot();
     connectWS();
@@ -60,10 +99,10 @@ document.addEventListener("DOMContentLoaded", function() {
         el.addEventListener("shown.bs.tab", function(e) {
             S.activeTab = e.target.dataset.tab;
             if (S.activeTab === "files") {
-                if (!S.filePath) browsePath("");
+                if (!S.filePath) browsePath(S.fileBrowserRoot || "");
                 loadDiskInfo();
             }
-            if (S.activeTab === "jobs") renderJobs();
+            if (S.activeTab === "jobs") renderJobs(true);
             if (S.activeTab === "cluster") renderCluster();
             if (S.activeTab === "history") loadHistoryJobs();
             if (S.activeTab === "loginnode") loadLoginNodeInfo();
@@ -76,8 +115,35 @@ document.addEventListener("DOMContentLoaded", function() {
         dz.addEventListener("drop", function(e) { e.preventDefault(); dz.classList.remove("border-primary"); handleFileSelect(e.dataTransfer.files); });
         dz.addEventListener("click", function() { document.getElementById("uploadFileInput").click(); });
     }
+    var filesFilterInput = document.getElementById("filesFilterInput");
+    if (filesFilterInput) {
+        filesFilterInput.addEventListener("input", function(e) { setFilesFilter(e.target.value); });
+    }
+    var loginProcessSearch = document.getElementById("loginProcessSearch");
+    if (loginProcessSearch) {
+        loginProcessSearch.addEventListener("input", function(e) { setLoginProcessSearch(e.target.value); });
+    }
+    syncFilesFilterUi();
+    renderFileTableHeader();
+    syncFileLayoutModeUi();
+    syncHiddenFilesUi();
+    updateFileNavButtons();
+    syncFileWriteControls();
+    updateLoginNodeControls();
+    document.addEventListener("click", function(e) {
+        var menu = document.getElementById("fileColumnMenu");
+        if (menu && !menu.classList.contains("d-none") && !menu.contains(e.target)) {
+            menu.classList.add("d-none");
+        }
+    });
     document.addEventListener("keydown", function(e) {
-        if ((e.ctrlKey || e.metaKey) && e.key === "s" && S.editingFile) { e.preventDefault(); editorSave(); }
+        if (e.key === "Escape") {
+            var menu = document.getElementById("fileColumnMenu");
+            if (menu) menu.classList.add("d-none");
+        }
+    });
+    document.addEventListener("keydown", function(e) {
+        if ((e.ctrlKey || e.metaKey) && e.key === "s" && S.editingFile && S.editorMode === "text") { e.preventDefault(); editorSave(); }
     });
     // Fix job charts: draw after modal fully visible
     var jobModal = document.getElementById("jobModal");
@@ -121,7 +187,11 @@ function loadSettingsFromServer() {
         if (s.historyTrackUsers) S.historyTrackUsers = s.historyTrackUsers;
         if (s.clusterUsername) S.clusterUsername = s.clusterUsername;
         if (typeof s.numaTrackEnabled === "boolean") S.numaTrackEnabled = s.numaTrackEnabled;
+        if (typeof s.loginNodeDetailedCommands === "boolean") S.loginDetailedCommands = s.loginNodeDetailedCommands;
+        if (typeof s.loginNodeExcludeRoot === "boolean") S.loginExcludeRoot = s.loginNodeExcludeRoot;
+        if (typeof s.filePreviewZoomStep === "number") S.previewZoomStep = clampPreviewZoomStep(s.filePreviewZoomStep);
         if (s.nodeVisibility && typeof s.nodeVisibility === "object") S._nodeVisibility = s.nodeVisibility;
+        updateLoginNodeControls();
     }).catch(function() {});
 }
 
@@ -186,6 +256,13 @@ function onRefreshIntervalChange(val) {
     saveSettingsToServer({refreshIntervalSec: secs});
 }
 
+function clampPreviewZoomStep(val) {
+    var step = parseInt(val) || 10;
+    if (step < 1) step = 1;
+    if (step > 50) step = 50;
+    return step;
+}
+
 function openSettings() {
     var el1 = document.getElementById("settHistoryMin");
     var el2 = document.getElementById("settRefreshSec");
@@ -205,9 +282,18 @@ function openSettings() {
     if (el8) el8.value = S.clusterUsername || "";
     var el9 = document.getElementById("settNumaTrackEnabled");
     if (el9) el9.checked = S.numaTrackEnabled;
+    var el10 = document.getElementById("settLoginDetailedCommands");
+    if (el10) el10.checked = S.loginDetailedCommands;
+    var el11 = document.getElementById("settLoginExcludeRoot");
+    if (el11) el11.checked = S.loginExcludeRoot;
+    var el12 = document.getElementById("settPreviewZoomStep");
+    if (el12) el12.value = clampPreviewZoomStep(S.previewZoomStep);
     // 灰化逻辑：maxCacheMB > 0 时，日期输入框禁用
     updateRetainDateState();
-    if (el5) el5.addEventListener("input", updateRetainDateState);
+    if (el5 && !S._retainDateListenerBound) {
+        el5.addEventListener("input", updateRetainDateState);
+        S._retainDateListenerBound = true;
+    }
     // 加载节点可见性表格
     loadNodeVisibilityTable();
     // 加载缓存统计
@@ -240,6 +326,9 @@ function saveSettings() {
     var trackUsers = (document.getElementById("settHistoryTrackUsers").value || "").trim();
     var clusterUser = (document.getElementById("settClusterUsername").value || "").trim();
     var numaTrack = document.getElementById("settNumaTrackEnabled").checked;
+    var loginDetailed = document.getElementById("settLoginDetailedCommands").checked;
+    var loginExcludeRoot = document.getElementById("settLoginExcludeRoot").checked;
+    var zoomStep = clampPreviewZoomStep(parseInt(document.getElementById("settPreviewZoomStep").value) || 10);
 
     S.historyDuration = mins * 60;
     S.refreshInterval = secs;
@@ -250,6 +339,9 @@ function saveSettings() {
     S.historyTrackUsers = trackUsers;
     S.clusterUsername = clusterUser;
     S.numaTrackEnabled = numaTrack;
+    S.loginDetailedCommands = loginDetailed;
+    S.loginExcludeRoot = loginExcludeRoot;
+    S.previewZoomStep = zoomStep;
 
     // 收集节点可见性设置（表格未加载时保留已有设置）
     var nv = collectNodeVisibility();
@@ -277,6 +369,9 @@ function saveSettings() {
         historyTrackUsers: trackUsers,
         clusterUsername: clusterUser,
         numaTrackEnabled: numaTrack,
+        loginNodeDetailedCommands: loginDetailed,
+        loginNodeExcludeRoot: loginExcludeRoot,
+        filePreviewZoomStep: zoomStep,
         nodeVisibility: nv
     });
 
@@ -352,13 +447,13 @@ function collectNodeVisibility() {
     return nv;
 }
 
-function showToast(msg) {
+function showToast(msg, durationMs) {
     var t = document.createElement("div");
     t.className = "position-fixed bottom-0 end-0 p-3";
     t.style.zIndex = "9999";
     t.innerHTML = '<div class="toast show align-items-center text-bg-success border-0" role="alert"><div class="d-flex"><div class="toast-body">' + msg + '</div></div></div>';
     document.body.appendChild(t);
-    setTimeout(function() { t.style.transition = "opacity 0.5s"; t.style.opacity = "0"; setTimeout(function() { t.remove(); }, 500); }, 1500);
+    setTimeout(function() { t.style.transition = "opacity 0.5s"; t.style.opacity = "0"; setTimeout(function() { t.remove(); }, 500); }, durationMs || 1500);
 }
 
 /* ── Polling ── */
@@ -463,7 +558,7 @@ function updateUI() {
     }
     try {
         if (S.activeTab === "cluster") renderCluster();
-        else if (S.activeTab === "jobs") renderJobs();
+        else if (S.activeTab === "jobs") renderJobs(false);
     } catch(e) { console.error("[renderTab]", e); }
     // 自动刷新打开的图表（节点详情/任务详情）—— 独立 try-catch 确保始终执行
     try { autoRefreshCharts(); } catch(e) { console.error("[autoRefreshCharts]", e); }
@@ -1110,17 +1205,39 @@ function setJobFilter(f, btn) {
     S.jobFilter = f;
     document.querySelectorAll("#tabJobs .filter-btns .btn").forEach(function(b) { b.classList.remove("active"); });
     if (btn) btn.classList.add("active");
-    renderJobs();
+    renderJobs(true);
 }
 function sortJobs(col) {
     if (S.jobSortCol === col) S.jobSortAsc = !S.jobSortAsc;
     else { S.jobSortCol = col; S.jobSortAsc = true; }
-    renderJobs();
+    renderJobs(true);
 }
-function renderJobs() {
+function renderJobs(force) {
     if (!S.data || !S.data.jobs) return;
+    var now = Date.now();
+    var qInput = document.getElementById("jobSearch");
+    var q = (qInput ? qInput.value : "").toLowerCase();
+    var jobsRaw = S.data.jobs || [];
+    // 轻量签名：数据未变化时跳过重复重绘，减少主线程抖动
+    var head = jobsRaw[0] || {};
+    var tail = jobsRaw[jobsRaw.length - 1] || {};
+    var sig = [
+        jobsRaw.length,
+        S.jobFilter,
+        S.jobSortCol,
+        S.jobSortAsc ? 1 : 0,
+        q,
+        S.data.timestamp || 0,
+        head.job_id || "", head.state || "", head.time_used || "",
+        tail.job_id || "", tail.state || "", tail.time_used || ""
+    ].join("|");
+    if (!force) {
+        if (sig === S._jobsLastSig) return;
+        if (now - S._jobsLastRenderAt < 350) return;
+    }
+    S._jobsLastSig = sig;
+    S._jobsLastRenderAt = now;
     var jobs = S.data.jobs.slice();
-    var q = (document.getElementById("jobSearch") ? document.getElementById("jobSearch").value : "").toLowerCase();
     if (q) jobs = jobs.filter(function(j) {
         return j.job_id.indexOf(q) >= 0 || j.name.toLowerCase().indexOf(q) >= 0 || j.user.toLowerCase().indexOf(q) >= 0 || (j.nodes||"").toLowerCase().indexOf(q) >= 0;
     });
@@ -1758,30 +1875,209 @@ function browseToDir(dir) {
 }
 
 /* ===== FILE BROWSER ===== */
-function browsePath(p) {
+var FILE_COLUMN_DEFS = [
+    {key: "name", label: "名称", sortable: true, minWidth: 180},
+    {key: "size", label: "大小", sortable: true, minWidth: 80},
+    {key: "mtime", label: "修改时间", sortable: true, minWidth: 140},
+    {key: "owner", label: "所有者", sortable: true, minWidth: 90},
+    {key: "perm", label: "权限", sortable: true, minWidth: 110},
+    {key: "ext", label: "类型", sortable: true, minWidth: 90},
+    {key: "actions", label: "操作", sortable: false, minWidth: 120}
+];
+
+function loadFileBrowserUiPrefs() {
+    try {
+        var raw = localStorage.getItem("slurmFileBrowserUiV1");
+        if (!raw) return;
+        var prefs = JSON.parse(raw);
+        if (prefs.fileLayoutMode === "tree" || prefs.fileLayoutMode === "list") S.fileLayoutMode = prefs.fileLayoutMode;
+        if (typeof prefs.showHiddenFiles === "boolean") S.showHiddenFiles = prefs.showHiddenFiles;
+        if (typeof prefs.fileColumnAutoWidth === "boolean") S.fileColumnAutoWidth = prefs.fileColumnAutoWidth;
+        if (typeof prefs.filePreviewFullscreenDefault === "boolean") S.filePreviewFullscreenDefault = prefs.filePreviewFullscreenDefault;
+        if (prefs.fileColumns) {
+            FILE_COLUMN_DEFS.forEach(function(def) {
+                if (typeof prefs.fileColumns[def.key] === "boolean") S.fileColumns[def.key] = prefs.fileColumns[def.key];
+            });
+            S.fileColumns.name = true;
+        }
+        if (prefs.fileColumnWidths) {
+            FILE_COLUMN_DEFS.forEach(function(def) {
+                var w = Number(prefs.fileColumnWidths[def.key]);
+                if (w >= def.minWidth) S.fileColumnWidths[def.key] = w;
+            });
+        }
+        if (Number(prefs.fileTreeWidth) >= 180) S._fileTreeWidth = Number(prefs.fileTreeWidth);
+    } catch(e) {}
+}
+
+function saveFileBrowserUiPrefs() {
+    try {
+        localStorage.setItem("slurmFileBrowserUiV1", JSON.stringify({
+            fileLayoutMode: S.fileLayoutMode,
+            showHiddenFiles: S.showHiddenFiles,
+            fileColumnAutoWidth: S.fileColumnAutoWidth,
+            filePreviewFullscreenDefault: S.filePreviewFullscreenDefault,
+            fileColumns: S.fileColumns,
+            fileColumnWidths: S.fileColumnWidths,
+            fileTreeWidth: S._fileTreeWidth
+        }));
+    } catch(e) {}
+}
+
+function syncBookmarkButton() {
+    var btn = document.getElementById("btnBookmarks");
+    if (btn) btn.classList.toggle("active", !!S.bookmarkViewActive);
+}
+
+function fileNavLocation() {
+    if (S.bookmarkViewActive) return {type: "bookmarks"};
+    if (!S.filePath) return null;
+    return {type: "path", path: normalizeFilePathKey(S.filePath)};
+}
+
+function normalizeFileNavLocation(loc) {
+    if (!loc || !loc.type) return null;
+    if (loc.type === "bookmarks") return {type: "bookmarks"};
+    if (loc.type === "path" && loc.path) return {type: "path", path: normalizeFilePathKey(loc.path)};
+    return null;
+}
+
+function sameFileNavLocation(a, b) {
+    a = normalizeFileNavLocation(a);
+    b = normalizeFileNavLocation(b);
+    if (!a || !b || a.type !== b.type) return false;
+    return a.type === "bookmarks" || a.path === b.path;
+}
+
+function pushFileNavTransition(from, to) {
+    from = normalizeFileNavLocation(from);
+    to = normalizeFileNavLocation(to);
+    if (!from || !to || sameFileNavLocation(from, to)) {
+        updateFileNavButtons();
+        return;
+    }
+    S._fileNavBack.push(from);
+    if (S._fileNavBack.length > 100) S._fileNavBack.shift();
+    S._fileNavForward = [];
+    updateFileNavButtons();
+}
+
+function updateFileNavButtons() {
+    var backBtn = document.getElementById("btnFileBack");
+    var forwardBtn = document.getElementById("btnFileForward");
+    if (backBtn) backBtn.disabled = S._fileNavBack.length === 0;
+    if (forwardBtn) forwardBtn.disabled = S._fileNavForward.length === 0;
+}
+
+function applyFileNavLocation(loc) {
+    loc = normalizeFileNavLocation(loc);
+    if (!loc) return Promise.resolve();
+    S._fileNavSuppress = true;
+    if (loc.type === "bookmarks") {
+        S.bookmarkViewActive = true;
+        syncBookmarkButton();
+        renderBookmarkList();
+        S._fileNavSuppress = false;
+        updateFileNavButtons();
+        return Promise.resolve();
+    }
+    S.bookmarkViewActive = false;
+    syncBookmarkButton();
+    return browsePath(loc.path, {skipHistory: true}).then(function() {
+        S._fileNavSuppress = false;
+        updateFileNavButtons();
+    }).catch(function() {
+        S._fileNavSuppress = false;
+        updateFileNavButtons();
+    });
+}
+
+function goFileBack() {
+    var target = S._fileNavBack.pop();
+    if (!target) { updateFileNavButtons(); return; }
+    var current = fileNavLocation();
+    if (current) S._fileNavForward.push(current);
+    updateFileNavButtons();
+    applyFileNavLocation(target);
+}
+
+function goFileForward() {
+    var target = S._fileNavForward.pop();
+    if (!target) { updateFileNavButtons(); return; }
+    var current = fileNavLocation();
+    if (current) S._fileNavBack.push(current);
+    updateFileNavButtons();
+    applyFileNavLocation(target);
+}
+
+function browsePath(p, opts) {
+    opts = opts || {};
     var prevPath = S.filePath;
+    var fromLocation = opts.fromLocation || fileNavLocation();
+    rememberFilesFilterForPath(prevPath, S.filesFilterText);
     S.filePath = p;
     var pi = document.getElementById("pathInput"); if (pi) pi.value = p;
     var url = "/api/files?path=" + encodeURIComponent(p);
     if (S.showFolderSizes) url += "&folder_sizes=1";
-    fetch(url).then(function(r) { return r.json(); }).then(function(d) {
+    return fetch(url).then(function(r) {
+        return r.json().then(function(d) {
+            d._status = r.status;
+            return d;
+        });
+    }).then(function(d) {
         if (d.error) {
-            alert(d.error);
+            showToast(d._status === 403 || d.error === "Access denied" ? "无权限访问" : d.error, 1000);
             // 访问拒绝防呆：回到上一个位置
             if (prevPath && prevPath !== p) {
                 S.filePath = prevPath;
                 if (pi) pi.value = prevPath;
+                applyFilesFilterForPath(prevPath);
             }
+            updateFileNavButtons();
             return;
         }
-        S.filePath = d.path; if (pi) pi.value = d.path;
-        renderFiles(d.entries || []);
+        var shouldCloseEditor = !!opts.closeEditorOnSuccess &&
+            normalizeFilePathKey(d.path) !== normalizeFilePathKey(prevPath);
+        var commitBrowse = function() {
+            S.filePath = d.path; if (pi) pi.value = d.path;
+            S.bookmarkViewActive = false;
+            syncBookmarkButton();
+            S.fileAllowWrite = d.allow_write !== false;
+            syncFileWriteControls();
+            applyFilesFilterForPath(d.path);
+            if (S.fileLayoutMode === "tree") expandFileTreeToPath(d.path);
+            if (!S._fileNavSuppress && !opts.skipHistory) {
+                pushFileNavTransition(fromLocation, {type: "path", path: d.path});
+            }
+            renderFiles(d.entries || [], {resetScroll: true});
+            if (shouldCloseEditor) closeEditorNow();
+            updateFileNavButtons();
+        };
+        if (shouldCloseEditor && hasUnsavedTextEdit()) {
+            return confirmUnsavedEditorChange().then(function(ok) {
+                if (!ok) {
+                    if (prevPath) {
+                        S.filePath = prevPath;
+                        if (pi) pi.value = prevPath;
+                        applyFilesFilterForPath(prevPath);
+                    }
+                    updateFileNavButtons();
+                    return false;
+                }
+                commitBrowse();
+                return true;
+            });
+        }
+        commitBrowse();
+        return true;
     }).catch(function(e) {
         console.warn("browse err:", e);
         if (prevPath && prevPath !== p) {
             S.filePath = prevPath;
             if (pi) pi.value = prevPath;
+            applyFilesFilterForPath(prevPath);
         }
+        updateFileNavButtons();
     });
 }
 function browseParent() {
@@ -1790,16 +2086,567 @@ function browseParent() {
     browsePath(parts.join("/") || "/");
 }
 function browseHome() {
-    browsePath(S.clusterUsername ? ("/home/" + S.clusterUsername) : "");
+    browsePath(S.fileBrowserRoot || "");
 }
 function refreshFiles() {
-    browsePath(S.filePath || "");
+    browsePath(S.filePath || S.fileBrowserRoot || "", {skipHistory: true});
     loadDiskInfo();
+}
+function normalizeFilePathKey(path) {
+    var key = String(path || "");
+    key = key.replace(/\/+$/, "");
+    return key || "/";
+}
+function rememberFilesFilterForPath(path, text) {
+    if (!path) return;
+    var key = normalizeFilePathKey(path);
+    var val = String(text || "").trim().toLowerCase();
+    if (val) S._filesFilterByPath[key] = val;
+    else delete S._filesFilterByPath[key];
+    S.filesFilterText = val;
+}
+function getFilesFilterForPath(path) {
+    var key = normalizeFilePathKey(path || S.filePath);
+    return S._filesFilterByPath[key] || "";
+}
+function applyFilesFilterForPath(path) {
+    S.filesFilterText = getFilesFilterForPath(path);
+    syncFilesFilterUi();
+}
+function setFilesFilter(text) {
+    rememberFilesFilterForPath(S.filePath, text);
+    syncFilesFilterUi();
+    if (S._filesFilterTimer) clearTimeout(S._filesFilterTimer);
+    S._filesFilterTimer = setTimeout(function() {
+        S._filesFilterTimer = null;
+        renderFiles(S._lastFileEntries || []);
+    }, 120);
+}
+function clearFilesFilter() {
+    rememberFilesFilterForPath(S.filePath, "");
+    syncFilesFilterUi();
+    renderFiles(S._lastFileEntries || []);
+}
+function syncFilesFilterUi() {
+    var input = document.getElementById("filesFilterInput");
+    if (input && input.value !== S.filesFilterText) input.value = S.filesFilterText;
+    var clearBtn = document.getElementById("btnClearFilesFilter");
+    if (clearBtn) clearBtn.disabled = !S.filesFilterText;
+}
+
+function isHiddenFileName(name) {
+    return String(name || "").charAt(0) === ".";
+}
+
+function syncHiddenFilesUi() {
+    var btn = document.getElementById("btnShowHiddenFiles");
+    if (!btn) return;
+    btn.classList.toggle("active", !!S.showHiddenFiles);
+    btn.title = S.showHiddenFiles ? "隐藏 . 开头文件" : "显示 . 开头文件";
+    btn.innerHTML = S.showHiddenFiles ? '<i class="bi bi-eye"></i>' : '<i class="bi bi-eye-slash"></i>';
+}
+
+function toggleHiddenFiles() {
+    S.showHiddenFiles = !S.showHiddenFiles;
+    syncHiddenFilesUi();
+    renderFiles(S._lastFileEntries || []);
+    if (S.fileLayoutMode === "tree") renderFileTree();
+    saveFileBrowserUiPrefs();
+}
+
+function syncFileWriteControls() {
+    ["btnUploadFile", "btnCreateFolder"].forEach(function(id) {
+        var btn = document.getElementById(id);
+        if (!btn) return;
+        btn.disabled = !S.fileAllowWrite;
+        btn.classList.toggle("disabled", !S.fileAllowWrite);
+        if (!S.fileAllowWrite) btn.title = "当前目录仅允许读取";
+        else if (id === "btnUploadFile") btn.title = "上传";
+        else btn.title = "新建文件夹";
+    });
+}
+
+function getVisibleFileColumns() {
+    return FILE_COLUMN_DEFS.filter(function(def) {
+        return S.fileColumns[def.key] !== false;
+    });
+}
+
+function getFileColumnDef(key) {
+    for (var i = 0; i < FILE_COLUMN_DEFS.length; i++) {
+        if (FILE_COLUMN_DEFS[i].key === key) return FILE_COLUMN_DEFS[i];
+    }
+    return null;
+}
+
+function visibleFileColspan() {
+    return Math.max(1, getVisibleFileColumns().length);
+}
+
+function fileColumnDisplayText(def, e) {
+    if (!def) return "";
+    if (!e) return def.label || "";
+    if (def.key === "name") return String(e.name || "");
+    if (def.key === "size") {
+        if (e.type === "dir") return e.size > 0 ? formatSize(e.size) : "-";
+        return formatSize(e.size || 0);
+    }
+    if (def.key === "mtime") return e.mtime ? new Date(e.mtime * 1000).toLocaleString() : "-";
+    if (def.key === "owner") return e.owner || "-";
+    if (def.key === "perm") return e.perm || "-";
+    if (def.key === "ext") return fileEntryTypeLabel(e);
+    if (def.key === "actions") return "下载 删除 提交 运行 取消收藏";
+    return "";
+}
+
+function fileAutoFitSignature(entries) {
+    var cols = getVisibleFileColumns().map(function(def) { return def.key; }).join(",");
+    var entrySig = (entries || []).map(function(e) {
+        return [
+            e.name || "",
+            e.type || "",
+            e.size || 0,
+            e.mtime || 0,
+            e.owner || "",
+            e.perm || "",
+            e.ext || ""
+        ].join("\u0001");
+    }).sort().join("\u0002");
+    return [
+        normalizeFilePathKey(S.bookmarkViewActive ? "bookmarks" : S.filePath),
+        cols,
+        S.filesFilterText || "",
+        S.showHiddenFiles ? "1" : "0",
+        entrySig
+    ].join("\u0003");
+}
+
+function ensureFileColumnMeasurer() {
+    var measurer = document.getElementById("fileColumnTextMeasurer");
+    if (!measurer) {
+        measurer = document.createElement("table");
+        measurer.id = "fileColumnTextMeasurer";
+        document.body.appendChild(measurer);
+    }
+    measurer.className = "table table-sm file-column-text-measurer";
+    return measurer;
+}
+
+function measureFileColumnCellWidth(def, e) {
+    var measurer = ensureFileColumnMeasurer();
+    measurer.innerHTML = '<tbody><tr>' + fileEntryCellHtml(def, e || {}, "") + '</tr></tbody>';
+    var cell = measurer.querySelector("td");
+    var width = cell ? Math.ceil(cell.getBoundingClientRect().width) : 0;
+    measurer.innerHTML = "";
+    return width;
+}
+
+function measureFileColumnHeaderWidth(def) {
+    var measurer = ensureFileColumnMeasurer();
+    measurer.innerHTML = '<thead><tr><th class="file-th file-col-' + def.key + '">' +
+        esc(def.label || "") + (def.sortable ? fileSortIcon(def.key) : "") + '</th></tr></thead>';
+    var th = measurer.querySelector("th");
+    var width = th ? Math.ceil(th.getBoundingClientRect().width) : 0;
+    measurer.innerHTML = "";
+    return width;
+}
+
+function updateFileTableWidth() {
+    var table = document.getElementById("fileTable");
+    if (!table) return;
+    var total = 0;
+    getVisibleFileColumns().forEach(function(def) {
+        total += Math.max(def.minWidth, Math.ceil(Number(S.fileColumnWidths[def.key] || def.minWidth)));
+    });
+    table.style.width = total + "px";
+}
+
+function autoFitFileColumnWidths(entries, force) {
+    if (!S.fileColumnAutoWidth) return;
+    var sig = fileAutoFitSignature(entries);
+    if (!force && sig === S._fileAutoFitSignature) return;
+    S._fileAutoFitSignature = sig;
+    var cols = getVisibleFileColumns();
+    cols.forEach(function(def) {
+        var maxW = measureFileColumnHeaderWidth(def);
+        (entries || []).forEach(function(e) {
+            maxW = Math.max(maxW, measureFileColumnCellWidth(def, e));
+        });
+        var buffer = def.key === "name" ? 6 : def.key === "actions" ? 4 : 8;
+        var cap = def.key === "name" ? 3200 : def.key === "mtime" ? 230 : def.key === "actions" ? 170 : 260;
+        var w = Math.max(def.minWidth, Math.min(cap, maxW + buffer));
+        S.fileColumnWidths[def.key] = w;
+    });
+}
+
+function fileSortIcon(key) {
+    if (S.fileSortCol !== key) return '<i class="bi bi-chevron-expand ms-1"></i>';
+    return S.fileSortAsc ? '<i class="bi bi-chevron-up ms-1"></i>' : '<i class="bi bi-chevron-down ms-1"></i>';
+}
+
+function renderFileTableHeader() {
+    var thead = document.getElementById("fileTableHead");
+    var table = document.getElementById("fileTable");
+    if (!thead || !table) return;
+    var cols = getVisibleFileColumns();
+    var colgroup = "<colgroup>";
+    var totalWidth = 0;
+    cols.forEach(function(def) {
+        var w = Number(S.fileColumnWidths[def.key] || def.minWidth);
+        w = Math.max(def.minWidth, w);
+        totalWidth += w;
+        colgroup += '<col data-file-col="' + def.key + '" style="width:' + w + 'px">';
+    });
+    colgroup += "</colgroup>";
+    var oldColgroup = table.querySelector("colgroup");
+    if (oldColgroup) oldColgroup.remove();
+    table.insertAdjacentHTML("afterbegin", colgroup);
+    var html = '<tr oncontextmenu="showFileColumnMenu(event)">';
+    cols.forEach(function(def) {
+        var w = Math.max(def.minWidth, Number(S.fileColumnWidths[def.key] || def.minWidth));
+        var sortAttrs = def.sortable ? ' onclick="sortFiles(event,\'' + def.key + '\')"' : '';
+        var sortClass = def.sortable ? " sortable" : "";
+        html += '<th class="file-th file-col-' + def.key + sortClass + '" data-file-col="' + def.key + '" style="width:' + w + 'px"' + sortAttrs + '>';
+        html += '<span class="file-th-label">' + def.label + (def.sortable ? fileSortIcon(def.key) : '') + '</span>';
+        html += '<span class="file-col-resizer" onclick="event.preventDefault();event.stopPropagation()" onmousedown="startFileColumnResize(event,\'' + def.key + '\')"></span>';
+        html += '</th>';
+    });
+    html += '</tr>';
+    thead.innerHTML = html;
+    table.style.width = totalWidth + "px";
+}
+
+function showFileColumnMenu(event) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+    var menu = document.getElementById("fileColumnMenu");
+    if (!menu) return false;
+    var autoChecked = S.fileColumnAutoWidth ? " checked" : "";
+    var html = '<div class="file-column-menu-title">显示栏目</div>';
+    html += '<label class="file-column-menu-item">';
+    html += '<input class="form-check-input me-2" type="checkbox"' + autoChecked + ' onchange="setFileColumnAutoWidth(this.checked)">';
+    html += '<span>宽度自适应</span></label>';
+    html += '<div class="file-column-menu-sep"></div>';
+    FILE_COLUMN_DEFS.forEach(function(def) {
+        var checked = S.fileColumns[def.key] !== false ? " checked" : "";
+        var disabled = def.key === "name" ? " disabled" : "";
+        html += '<label class="file-column-menu-item">';
+        html += '<input class="form-check-input me-2" type="checkbox"' + checked + disabled + ' onchange="setFileColumnVisible(\'' + def.key + '\',this.checked)">';
+        html += '<span>' + def.label + '</span></label>';
+    });
+    menu.innerHTML = html;
+    var x = event ? event.clientX : 0;
+    var y = event ? event.clientY : 0;
+    menu.style.left = Math.min(x, window.innerWidth - 190) + "px";
+    menu.style.top = Math.min(y, window.innerHeight - 260) + "px";
+    menu.classList.remove("d-none");
+    return false;
+}
+
+function setFileColumnAutoWidth(enabled) {
+    S.fileColumnAutoWidth = !!enabled;
+    S._fileAutoFitSignature = "";
+    if (S.fileColumnAutoWidth) {
+        if (S.bookmarkViewActive) renderBookmarkList({forceAutoFit: true});
+        else renderFiles(S._lastFileEntries || [], {forceAutoFit: true});
+    } else {
+        renderFileTableHeader();
+    }
+    saveFileBrowserUiPrefs();
+}
+
+function setFileColumnVisible(key, visible) {
+    if (key === "name" && !visible) return;
+    S.fileColumns[key] = !!visible;
+    S._fileAutoFitSignature = "";
+    renderFileTableHeader();
+    renderFiles(S._lastFileEntries || [], {forceAutoFit: true});
+    saveFileBrowserUiPrefs();
+}
+
+function startFileColumnResize(event, key) {
+    if (!event) return;
+    event.preventDefault();
+    event.stopPropagation();
+    var def = getFileColumnDef(key);
+    if (!def) return;
+    if (S.fileColumnAutoWidth) {
+        S.fileColumnAutoWidth = false;
+        S._fileAutoFitSignature = "";
+        saveFileBrowserUiPrefs();
+    }
+    S._fileColumnResize = {
+        key: key,
+        startX: event.clientX,
+        startWidth: Math.max(def.minWidth, Number(S.fileColumnWidths[key] || def.minWidth)),
+        minWidth: def.minWidth
+    };
+    S._suppressFileSortUntil = Date.now() + 500;
+    document.body.classList.add("file-col-resizing");
+}
+
+function setFileLayoutMode(mode) {
+    S.fileLayoutMode = mode === "tree" ? "tree" : "list";
+    syncFileLayoutModeUi();
+    saveFileBrowserUiPrefs();
+}
+
+function toggleFileSidebar() {
+    setFileLayoutMode(S.fileLayoutMode === "tree" ? "list" : "tree");
+}
+
+function syncFileLayoutModeUi() {
+    var treeMode = S.fileLayoutMode === "tree";
+    var treeCol = document.getElementById("fileTreeCol");
+    var treeSplitter = document.getElementById("fileTreeSplitter");
+    var row = document.getElementById("fileRow");
+    if (treeCol) {
+        treeCol.classList.toggle("d-none", !treeMode);
+        treeCol.style.flexBasis = Math.max(180, S._fileTreeWidth) + "px";
+    }
+    if (treeSplitter) treeSplitter.classList.toggle("d-none", !treeMode);
+    if (row) row.classList.toggle("file-tree-mode", treeMode);
+    var sidebarBtn = document.getElementById("btnFileSidebar");
+    if (sidebarBtn) {
+        sidebarBtn.classList.toggle("active", treeMode);
+        sidebarBtn.title = treeMode ? "隐藏目录树侧栏" : "显示目录树侧栏";
+    }
+    if (treeMode) {
+        expandFileTreeToPath(S.filePath || S.fileBrowserRoot || "/");
+    }
+}
+
+function fileTreeCanBrowse(path) {
+    var key = normalizeFilePathKey(path);
+    return !!key && S._fileTreeReadable[key] !== false;
+}
+
+function loadFileTreePath(path, opts) {
+    opts = opts || {};
+    var key = normalizeFilePathKey(path || "/");
+    if (S._fileTreeReadable[key] === false) {
+        if (opts.notifyAccessDenied) showToast("无权限访问", 1000);
+        return Promise.resolve([]);
+    }
+    if (S._fileTreeChildren[key]) return Promise.resolve(S._fileTreeChildren[key]);
+    if (S._fileTreeLoading[key]) return S._fileTreeLoading[key];
+    var body = document.getElementById("fileTreeBody");
+    if (body && key === "/") body.innerHTML = '<div class="text-muted small p-2">正在加载目录树...</div>';
+    S._fileTreeLoading[key] = fetch("/api/file-tree?path=" + encodeURIComponent(key))
+        .then(function(r) {
+            return r.json().then(function(d) {
+                d._status = r.status;
+                return d;
+            });
+        })
+        .then(function(d) {
+            delete S._fileTreeLoading[key];
+            if (d.error) {
+                if (d._status === 403 || d.error === "Access denied") {
+                    S._fileTreeReadable[key] = false;
+                    if (opts.notifyAccessDenied) showToast("无权限访问", 1000);
+                }
+                S._fileTreeChildren[key] = [];
+                S._fileTreeTruncated[key] = false;
+                renderFileTree();
+                return [];
+            }
+            var normalized = normalizeFilePathKey(d.path || key);
+            S._fileTreeReadable[normalized] = d.can_read !== false;
+            S._fileTreeChildren[normalized] = Array.isArray(d.entries) ? d.entries : [];
+            S._fileTreeChildren[normalized].forEach(function(child) {
+                S._fileTreeReadable[normalizeFilePathKey(child.path)] = child.can_read !== false;
+            });
+            S._fileTreeTruncated[normalized] = !!d.truncated;
+            renderFileTree();
+            return S._fileTreeChildren[normalized];
+        })
+        .catch(function() {
+            delete S._fileTreeLoading[key];
+            S._fileTreeChildren[key] = [];
+            renderFileTree();
+            return [];
+        });
+    return S._fileTreeLoading[key];
+}
+
+function expandFileTreeToPath(path) {
+    if (S.fileLayoutMode !== "tree") return;
+    var key = normalizeFilePathKey(path || "/");
+    var parts = key.split("/").filter(Boolean);
+    var paths = ["/"];
+    var cur = "";
+    parts.forEach(function(part) {
+        cur += "/" + part;
+        paths.push(cur);
+    });
+    var chain = Promise.resolve();
+    paths.forEach(function(nodePath, idx) {
+        chain = chain.then(function() {
+            if (idx < paths.length - 1) S._fileTreeExpanded[normalizeFilePathKey(nodePath)] = true;
+            return loadFileTreePath(nodePath);
+        });
+    });
+    chain.then(renderFileTree);
+}
+
+function fileTreeDepth(path) {
+    return normalizeFilePathKey(path).split("/").filter(Boolean).length;
+}
+
+function fileTreeParentPath(path) {
+    var key = normalizeFilePathKey(path);
+    if (key === "/") return "/";
+    var parts = key.split("/");
+    parts.pop();
+    return parts.join("/") || "/";
+}
+
+function visibleFileTreeChildren(path) {
+    var key = normalizeFilePathKey(path);
+    return sortFileEntriesForView((S._fileTreeChildren[key] || []).filter(function(child) {
+        return S.showHiddenFiles || !isHiddenFileName(child.name);
+    }));
+}
+
+function collectVisibleFileTreePaths(path, out) {
+    var key = normalizeFilePathKey(path);
+    out.push(key);
+    if (!S._fileTreeExpanded[key]) return;
+    visibleFileTreeChildren(key).forEach(function(child) {
+        collectVisibleFileTreePaths(child.path, out);
+    });
+}
+
+function collapseDeepestFileTreeLevel() {
+    var visible = [];
+    collectVisibleFileTreePaths("/", visible);
+    var maxDepth = visible.reduce(function(max, path) {
+        return Math.max(max, fileTreeDepth(path));
+    }, 0);
+    if (maxDepth <= 0) return;
+    var parents = {};
+    visible.forEach(function(path) {
+        if (fileTreeDepth(path) === maxDepth) parents[fileTreeParentPath(path)] = true;
+    });
+    Object.keys(parents).forEach(function(path) {
+        S._fileTreeExpanded[path] = false;
+    });
+    renderFileTree();
+}
+
+function collapseFileTreeToCurrentLevel() {
+    var current = normalizeFilePathKey(S.filePath || "/");
+    var parts = current.split("/").filter(Boolean);
+    var keepExpanded = {};
+    if (parts.length > 0) keepExpanded["/"] = true;
+    var cur = "";
+    for (var i = 0; i < parts.length - 1; i++) {
+        cur += "/" + parts[i];
+        keepExpanded[cur] = true;
+    }
+    S._fileTreeExpanded = keepExpanded;
+    renderFileTree();
+    if (parts.length > 0) expandFileTreeToPath(current);
+}
+
+function toggleFileTreeNode(eventOrPath, pathMaybe) {
+    var event = pathMaybe !== undefined ? eventOrPath : null;
+    var path = pathMaybe !== undefined ? pathMaybe : eventOrPath;
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+    var key = normalizeFilePathKey(path);
+    if (!fileTreeCanBrowse(key)) {
+        showToast("无权限访问", 1000);
+        return false;
+    }
+    S._fileTreeExpanded[key] = !S._fileTreeExpanded[key];
+    if (S._fileTreeExpanded[key]) loadFileTreePath(key, {notifyAccessDenied: true}).then(renderFileTree);
+    else renderFileTree();
+    return false;
+}
+
+function onFileTreeNodeClick(eventOrPath, pathMaybe) {
+    var event = pathMaybe !== undefined ? eventOrPath : null;
+    var path = pathMaybe !== undefined ? pathMaybe : eventOrPath;
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+    var key = normalizeFilePathKey(path);
+    if (!fileTreeCanBrowse(key)) {
+        showToast("无权限访问", 1000);
+        return false;
+    }
+    if (S._fileTreeClickTimer) clearTimeout(S._fileTreeClickTimer);
+    S._fileTreeClickTimer = setTimeout(function() {
+        S._fileTreeClickTimer = null;
+        browsePath(key, {closeEditorOnSuccess: true});
+    }, 180);
+    return false;
+}
+
+function onFileTreeNodeDoubleClick(event, path) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+    var key = normalizeFilePathKey(path);
+    if (!fileTreeCanBrowse(key)) {
+        showToast("无权限访问", 1000);
+        return false;
+    }
+    if (S._fileTreeClickTimer) {
+        clearTimeout(S._fileTreeClickTimer);
+        S._fileTreeClickTimer = null;
+    }
+    S._fileTreeExpanded[key] = !S._fileTreeExpanded[key];
+    if (S._fileTreeExpanded[key]) {
+        loadFileTreePath(key, {notifyAccessDenied: true}).then(renderFileTree);
+        browsePath(key, {closeEditorOnSuccess: true});
+    } else {
+        renderFileTree();
+    }
+    return false;
+}
+
+function renderFileTree() {
+    var body = document.getElementById("fileTreeBody");
+    if (!body) return;
+    body.innerHTML = renderFileTreeNode("/", "<root>", 0);
+}
+
+function renderFileTreeNode(path, name, depth) {
+    var key = normalizeFilePathKey(path);
+    var expanded = !!S._fileTreeExpanded[key];
+    var children = visibleFileTreeChildren(key);
+    var loading = !!S._fileTreeLoading[key];
+    var current = normalizeFilePathKey(S.filePath) === key;
+    var browseable = fileTreeCanBrowse(key);
+    var toggleIcon = loading ? "bi-hourglass-split" : expanded ? "bi-chevron-down" : "bi-chevron-right";
+    var folderCls = browseable ? "text-warning" : "text-secondary";
+    var html = '<div class="file-tree-node ' + (current ? 'active ' : '') + (browseable ? '' : 'readonly ') + '" onclick="onFileTreeNodeClick(event,\'' + escAttr(key) + '\')" ondblclick="onFileTreeNodeDoubleClick(event,\'' + escAttr(key) + '\')" style="padding-left:' + (depth * 16 + 6) + 'px" title="' + escAttr(key) + '">';
+    html += '<button class="file-tree-toggle" onclick="toggleFileTreeNode(event,\'' + escAttr(key) + '\')" title="展开/收起"><i class="bi ' + toggleIcon + '"></i></button>';
+    html += '<span class="file-tree-name"><i class="bi bi-folder-fill ' + folderCls + ' me-1"></i>' + esc(name) + '</span>';
+    html += '</div>';
+    if (expanded) {
+        children.forEach(function(child) {
+            html += renderFileTreeNode(child.path, child.name, depth + 1);
+        });
+        if (S._fileTreeTruncated[key]) {
+            html += '<div class="file-tree-truncated" style="padding-left:' + ((depth + 1) * 16 + 26) + 'px">已截断，目录过多</div>';
+        }
+    }
+    return html;
 }
 
 /* 磁盘空间信息 */
 function loadDiskInfo() {
-    var path = S.filePath || "";
+    var path = S.filePath || S.fileBrowserRoot || "";
     fetch("/api/disk-info?path=" + encodeURIComponent(path))
         .then(function(r) { return r.json(); })
         .then(function(d) {
@@ -1830,10 +2677,59 @@ function formatSizeAuto(bytes) {
     if (bytes < 1099511627776) return (bytes/1073741824).toFixed(1) + "GB";
     return (bytes/1099511627776).toFixed(1) + "TB";
 }
-function sortFiles(col) {
+
+function fileFilterTerms(text) {
+    return String(text || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+}
+
+function fileEntrySearchHaystack(e) {
+    return [
+        e.name || "",
+        e.owner || "",
+        e.perm || "",
+        e.ext || "",
+        fileEntryTypeLabel(e)
+    ].join(" ").toLowerCase();
+}
+
+function fileEntryMatchesFilter(e, terms) {
+    if (!terms || terms.length === 0) return true;
+    var haystack = fileEntrySearchHaystack(e);
+    return terms.every(function(term) { return haystack.indexOf(term) >= 0; });
+}
+
+function compareFileEntriesForView(a, b, dirFirst) {
+    if (dirFirst !== false && a.type !== b.type) return a.type === "dir" ? -1 : 1;
+    var sc = S.fileSortCol;
+    var va = sc === "ext" ? fileEntryTypeLabel(a) : a[sc];
+    var vb = sc === "ext" ? fileEntryTypeLabel(b) : b[sc];
+    if (sc === "size" || sc === "mtime") {
+        va = Number(va || 0);
+        vb = Number(vb || 0);
+        return S.fileSortAsc ? va - vb : vb - va;
+    }
+    va = String(va || "").toLowerCase();
+    vb = String(vb || "").toLowerCase();
+    return S.fileSortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+}
+
+function sortFileEntriesForView(entries, dirFirst) {
+    return (entries || []).slice().sort(function(a, b) {
+        return compareFileEntriesForView(a, b, dirFirst);
+    });
+}
+
+function sortFiles(event, col) {
+    if (typeof event === "string" && col === undefined) {
+        col = event;
+        event = null;
+    }
+    if (event && event.target && event.target.closest && event.target.closest(".file-col-resizer")) return;
+    if (Date.now() < (S._suppressFileSortUntil || 0)) return;
     if (S.fileSortCol === col) S.fileSortAsc = !S.fileSortAsc;
     else { S.fileSortCol = col; S.fileSortAsc = true; }
-    renderFiles(S._lastFileEntries || []);
+    renderFiles(S._lastFileEntries || [], {preserveScroll: true});
+    if (S.fileLayoutMode === "tree") renderFileTree();
 }
 function toggleFolderSizes() {
     S.showFolderSizes = !S.showFolderSizes;
@@ -1857,38 +2753,95 @@ function applyFileViewMode() {
     var splitter = document.getElementById("fileSplitter");
     var fsBtn = document.getElementById("btnFullscreen");
     if (S.fileViewMode === "full") {
-        browserCol.style.flex = "1";
-        browserCol.style.display = "";
+        if (browserCol) {
+            browserCol.style.flex = "1";
+            browserCol.style.display = "";
+        }
         if (editorCol) { editorCol.classList.add("d-none"); editorCol.style.flex = ""; }
         if (splitter) splitter.classList.add("d-none");
+        if (fsBtn) fsBtn.innerHTML = '<i class="bi bi-arrows-fullscreen"></i>';
+        if (fsBtn) fsBtn.title = "全屏预览";
     } else if (S.fileViewMode === "fullscreen") {
-        browserCol.style.display = "none";
+        if (browserCol) browserCol.style.display = "none";
         if (splitter) splitter.classList.add("d-none");
         if (editorCol) { editorCol.classList.remove("d-none"); editorCol.style.flex = "1"; }
         if (fsBtn) fsBtn.innerHTML = '<i class="bi bi-fullscreen-exit"></i>';
         if (fsBtn) fsBtn.title = "退出全屏";
     } else {
-        browserCol.style.flex = "0 0 40%";
-        browserCol.style.display = "";
+        if (browserCol) {
+            browserCol.style.flex = "0 0 40%";
+            browserCol.style.display = "";
+        }
         if (editorCol) { editorCol.classList.remove("d-none"); editorCol.style.flex = "1"; }
         if (splitter) splitter.classList.remove("d-none");
         if (fsBtn) fsBtn.innerHTML = '<i class="bi bi-arrows-fullscreen"></i>';
-        if (fsBtn) fsBtn.title = "全屏编辑";
+        if (fsBtn) fsBtn.title = "全屏预览";
     }
 }
 
-function closeEditor() {
+function openEditorPane() {
+    if (S.fileViewMode === "full") {
+        S.fileViewMode = S.filePreviewFullscreenDefault ? "fullscreen" : "split";
+    }
+    applyFileViewMode();
+}
+
+function releasePreviewContent() {
+    S._filePreviewSeq += 1;
+    var container = document.getElementById("previewContainer");
+    if (!container) return;
+    container.querySelectorAll("iframe").forEach(function(frame) {
+        try { frame.removeAttribute("src"); } catch(e) {}
+    });
+    container.innerHTML = "";
+    container.scrollTop = 0;
+    container.scrollLeft = 0;
+}
+
+function closeEditorNow() {
+    if (S.fileViewMode === "fullscreen") {
+        S.filePreviewFullscreenDefault = true;
+        saveFileBrowserUiPrefs();
+    }
     S.fileViewMode = "full";
     S.editingFile = null;
+    S.editorMode = null;
+    S.editDirty = false;
+    S.previewKind = null;
+    S.previewZoom = 1;
+    var ta = document.getElementById("editorTextarea");
+    if (ta) {
+        ta.value = "";
+        ta.style.display = "none";
+        ta.oninput = null;
+        ta.onselect = null;
+    }
+    var ep = document.getElementById("editorPath");
+    if (ep) ep.textContent = "选择文件";
+    var ph = document.getElementById("editorPlaceholder");
+    if (ph) ph.style.display = "";
+    releasePreviewContent();
+    hideEl("previewContainer");
+    syncPreviewZoomControls();
+    syncEditorScriptRunButton();
     applyFileViewMode();
+}
+
+function closeEditor() {
+    confirmUnsavedEditorChange().then(function(ok) {
+        if (ok) closeEditorNow();
+    });
 }
 
 function fullscreenEditor() {
     if (S.fileViewMode === "fullscreen") {
         S.fileViewMode = "split";
+        S.filePreviewFullscreenDefault = false;
     } else {
         S.fileViewMode = "fullscreen";
+        S.filePreviewFullscreenDefault = true;
     }
+    saveFileBrowserUiPrefs();
     applyFileViewMode();
 }
 
@@ -1932,20 +2885,66 @@ function editorPaste() {
             document.body.style.userSelect = "none";
         });
     }
+    var treeSplitterEl = document.getElementById("fileTreeSplitter");
+    if (treeSplitterEl) {
+        treeSplitterEl.addEventListener("mousedown", function(e) {
+            e.preventDefault();
+            S._fileTreeDragging = true;
+            document.body.style.cursor = "col-resize";
+            document.body.style.userSelect = "none";
+        });
+    }
     document.addEventListener("mousemove", function(e) {
+        if (S._fileColumnResize) {
+            e.preventDefault();
+            var resize = S._fileColumnResize;
+            var nextW = Math.max(resize.minWidth, resize.startWidth + (e.clientX - resize.startX));
+            S.fileColumnWidths[resize.key] = nextW;
+            var col = document.querySelector('col[data-file-col="' + resize.key + '"]');
+            var th = document.querySelector('th[data-file-col="' + resize.key + '"]');
+            if (col) col.style.width = nextW + "px";
+            if (th) th.style.width = nextW + "px";
+            updateFileTableWidth();
+            return;
+        }
+        if (S._fileTreeDragging) {
+            e.preventDefault();
+            var rowForTree = document.getElementById("fileRow");
+            var treeCol = document.getElementById("fileTreeCol");
+            if (!rowForTree || !treeCol) return;
+            var rectTree = rowForTree.getBoundingClientRect();
+            S._fileTreeWidth = Math.max(180, Math.min(520, e.clientX - rectTree.left));
+            treeCol.style.flexBasis = S._fileTreeWidth + "px";
+            return;
+        }
         if (!S._splitterDragging) return;
         e.preventDefault();
-        var row = document.getElementById("fileRow");
-        if (!row) return;
-        var rect = row.getBoundingClientRect();
-        var x = e.clientX - rect.left;
-        var pct = Math.max(15, Math.min(85, (x / rect.width) * 100));
         var browserCol = document.getElementById("fileBrowserCol");
         var editorCol = document.getElementById("fileEditorCol");
-        if (browserCol) browserCol.style.flex = "0 0 " + pct + "%";
-        if (editorCol) editorCol.style.flex = "1";
+        if (!browserCol || !editorCol) return;
+        var browserRect = browserCol.getBoundingClientRect();
+        var editorRect = editorCol.getBoundingClientRect();
+        var splitRect = splitterEl ? splitterEl.getBoundingClientRect() : {width: 6};
+        var totalWidth = Math.max(1, editorRect.right - browserRect.left);
+        var minPane = Math.min(220, Math.max(120, totalWidth * 0.28));
+        var nextWidth = e.clientX - browserRect.left - (splitRect.width || 0) / 2;
+        nextWidth = Math.max(minPane, Math.min(totalWidth - minPane, nextWidth));
+        browserCol.style.flex = "0 0 " + nextWidth + "px";
+        editorCol.style.flex = "1 1 0";
     });
     document.addEventListener("mouseup", function() {
+        if (S._fileColumnResize) {
+            S._fileColumnResize = null;
+            S._suppressFileSortUntil = Date.now() + 350;
+            document.body.classList.remove("file-col-resizing");
+            saveFileBrowserUiPrefs();
+        }
+        if (S._fileTreeDragging) {
+            S._fileTreeDragging = false;
+            saveFileBrowserUiPrefs();
+            document.body.style.cursor = "";
+            document.body.style.userSelect = "";
+        }
         if (S._splitterDragging) {
             S._splitterDragging = false;
             document.body.style.cursor = "";
@@ -1954,54 +2953,108 @@ function editorPaste() {
     });
 })();
 
-function renderFiles(entries) {
-    S._lastFileEntries = entries;
-    // 如果收藏夹视图激活，显示收藏夹
-    if (S.bookmarkViewActive) { renderBookmarkList(); return; }
-    var sorted = entries.slice();
-    var sc = S.fileSortCol, sa = S.fileSortAsc;
-    sorted.sort(function(a, b) {
-        if (a.type !== b.type) return a.type === "dir" ? -1 : 1;
-        var va = a[sc], vb = b[sc];
-        if (typeof va === "number" && typeof vb === "number") return sa ? va - vb : vb - va;
-        va = String(va || "").toLowerCase(); vb = String(vb || "").toLowerCase();
-        return sa ? va.localeCompare(vb) : vb.localeCompare(va);
+function fileChildPath(name) {
+    var base = normalizeFilePathKey(S.filePath || S.fileBrowserRoot || "/");
+    return base === "/" ? "/" + name : base + "/" + name;
+}
+
+function fileEntryTypeLabel(e) {
+    if (e.type === "dir") return "文件夹";
+    var ext = String(e.ext || "").toLowerCase();
+    if (!ext) ext = (String(e.name || "").split(".").pop() || "").toLowerCase();
+    if (!ext || ext === String(e.name || "").toLowerCase()) return "文件";
+    return ext;
+}
+
+function fileEntryActionHtml(e, fp) {
+    var html = '<div class="file-actions d-flex gap-1">';
+    if (e.type === "dir") {
+        html += '<button class="btn btn-sm btn-outline-info py-0" onclick="event.stopPropagation();downloadFolder(\'' + escAttr(fp) + '\')" title="下载文件夹(zip)"><i class="bi bi-download"></i></button>';
+        if (S.fileAllowWrite) {
+            html += '<button class="btn btn-sm btn-outline-danger py-0" onclick="event.stopPropagation();deleteFile(\'' + escAttr(fp) + '\')" title="删除"><i class="bi bi-trash"></i></button>';
+        }
+    } else {
+        html += '<a href="/api/file-download?path=' + encodeURIComponent(fp) + '" class="btn btn-sm btn-outline-info py-0" onclick="event.stopPropagation()" title="下载"><i class="bi bi-download"></i></a>';
+        if (S.fileAllowWrite && e.name.endsWith('.sbatch')) {
+            html += '<button class="btn btn-sm btn-outline-warning py-0" onclick="event.stopPropagation();submitSbatch(\'' + escAttr(fp) + '\')" title="提交sbatch作业"><i class="bi bi-send-fill"></i></button>';
+        }
+        if (S.fileAllowWrite && e.name.endsWith('.sh')) {
+            html += '<button class="btn btn-sm btn-outline-success py-0" onclick="event.stopPropagation();runBash(\'' + escAttr(fp) + '\')" title="运行bash脚本"><i class="bi bi-play-fill"></i></button>';
+        }
+        if (S.fileAllowWrite) {
+            html += '<button class="btn btn-sm btn-outline-danger py-0" onclick="event.stopPropagation();deleteFile(\'' + escAttr(fp) + '\')" title="删除"><i class="bi bi-trash"></i></button>';
+        }
+    }
+    html += '</div>';
+    return html;
+}
+
+function openFileEntry(path, type, name) {
+    if (type === "dir") {
+        browsePath(path);
+        return;
+    }
+    confirmUnsavedEditorChange().then(function(ok) {
+        if (!ok) return;
+        if (isPreviewable(name || path)) previewFile(path);
+        else viewFile(path);
     });
-    var tbody = document.getElementById("filesBody");
-    var html = "";
-    sorted.forEach(function(e) {
+}
+
+function fileEntryCellHtml(def, e, fp) {
+    if (def.key === "name") {
         var icon = e.type === "dir" ? "bi-folder-fill text-warning" : getFileIcon(e.name);
-        var size = e.type === "dir" ? (e.size > 0 ? formatSize(e.size) : "-") : formatSize(e.size);
-        var mtime = new Date(e.mtime * 1000).toLocaleString();
-        var fp = S.filePath + "/" + e.name;
         var isBookmarked = S.bookmarks.indexOf(fp) >= 0;
         var starCls = isBookmarked ? "bi-star-fill text-warning" : "bi-star";
         var starBtn = '<button class="btn btn-sm btn-link py-0 px-1" onclick="event.stopPropagation();toggleBookmark(\'' + escAttr(fp) + '\')" title="' + (isBookmarked ? '取消收藏' : '收藏') + '"><i class="bi ' + starCls + '"></i></button>';
-        if (e.type === "dir") {
-            html += '<tr><td>' + starBtn + '<i class="bi ' + icon + ' me-1"></i><a href="#" onclick="browsePath(\'' + escAttr(fp) + '\');return false">' + esc(e.name) + '</a></td>';
-            html += '<td>' + size + '</td><td class="small text-muted">' + mtime + '</td>';
-            html += '<td class="d-flex gap-1">';
-            html += '<button class="btn btn-sm btn-outline-info py-0" onclick="event.stopPropagation();downloadFolder(\'' + escAttr(fp) + '\')" title="下载文件夹(zip)"><i class="bi bi-download"></i></button>';
-            html += '<button class="btn btn-sm btn-outline-danger py-0" onclick="deleteFile(\'' + escAttr(fp) + '\')"><i class="bi bi-trash"></i></button>';
-            html += '</td></tr>';
-        } else {
-            var canPreview = isPreviewable(e.name);
-            var viewFn = canPreview ? "previewFile" : "viewFile";
-            html += '<tr><td>' + starBtn + '<i class="bi ' + icon + ' me-1"></i><a href="#" onclick="' + viewFn + '(\'' + escAttr(fp) + '\');return false">' + esc(e.name) + '</a></td>';
-            html += '<td>' + size + '</td><td class="small text-muted">' + mtime + '</td>';
-            html += '<td class="d-flex gap-1">';
-            html += '<a href="/api/file-download?path=' + encodeURIComponent(fp) + '" class="btn btn-sm btn-outline-info py-0" title="下载"><i class="bi bi-download"></i></a>';
-            if (e.name.endsWith('.sbatch')) {
-                html += '<button class="btn btn-sm btn-outline-warning py-0" onclick="event.stopPropagation();submitSbatch(\'' + escAttr(fp) + '\')" title="提交sbatch作业"><i class="bi bi-send-fill"></i></button>';
-            }
-            if (e.name.endsWith('.sh')) {
-                html += '<button class="btn btn-sm btn-outline-success py-0" onclick="event.stopPropagation();runBash(\'' + escAttr(fp) + '\')" title="运行bash脚本"><i class="bi bi-play-fill"></i></button>';
-            }
-            html += '<button class="btn btn-sm btn-outline-danger py-0" onclick="deleteFile(\'' + escAttr(fp) + '\')"><i class="bi bi-trash"></i></button>';
-            html += '</td></tr>';
-        }
+        return '<td class="file-cell file-cell-name">' + starBtn + '<i class="bi ' + icon + ' me-1"></i><span class="file-name-text" title="' + escAttr(e.name) + '">' + esc(e.name) + '</span></td>';
+    }
+    if (def.key === "size") {
+        var size = e.type === "dir" ? (e.size > 0 ? formatSize(e.size) : "-") : formatSize(e.size);
+        return '<td class="file-cell text-end">' + size + '</td>';
+    }
+    if (def.key === "mtime") return '<td class="file-cell small text-muted">' + new Date(e.mtime * 1000).toLocaleString() + '</td>';
+    if (def.key === "owner") return '<td class="file-cell">' + esc(e.owner || "-") + '</td>';
+    if (def.key === "perm") return '<td class="file-cell font-monospace">' + esc(e.perm || "-") + '</td>';
+    if (def.key === "ext") return '<td class="file-cell">' + esc(fileEntryTypeLabel(e)) + '</td>';
+    if (def.key === "actions") return '<td class="file-cell">' + fileEntryActionHtml(e, fp) + '</td>';
+    return '<td class="file-cell"></td>';
+}
+
+function renderFiles(entries, opts) {
+    opts = opts || {};
+    S._lastFileEntries = entries;
+    // 如果收藏夹视图激活，显示收藏夹
+    if (S.bookmarkViewActive) { renderBookmarkList(opts); return; }
+    var browserCol = document.getElementById("fileBrowserCol");
+    var oldScrollLeft = browserCol ? browserCol.scrollLeft : 0;
+    var filterTerms = fileFilterTerms(S.filesFilterText);
+    var filtered = entries.filter(function(e) {
+        if (!S.showHiddenFiles && isHiddenFileName(e.name)) return false;
+        return fileEntryMatchesFilter(e, filterTerms);
     });
+    var sorted = sortFileEntriesForView(filtered, true);
+    var tbody = document.getElementById("filesBody");
+    if (!tbody) return;
+    var cols = getVisibleFileColumns();
+    autoFitFileColumnWidths(sorted, !!opts.forceAutoFit || !!opts.resetScroll);
+    renderFileTableHeader();
+    var html = "";
+    sorted.forEach(function(e) {
+        var fp = fileChildPath(e.name);
+        html += '<tr class="file-row" onclick="openFileEntry(\'' + escAttr(fp) + '\',\'' + escAttr(e.type) + '\',\'' + escAttr(e.name) + '\')">';
+        cols.forEach(function(def) { html += fileEntryCellHtml(def, e, fp); });
+        html += '</tr>';
+    });
+    if (!html) {
+        html = '<tr><td colspan="' + visibleFileColspan() + '" class="text-center text-muted py-3">无匹配文件</td></tr>';
+    }
     tbody.innerHTML = html;
+    if (browserCol && opts.resetScroll) {
+        browserCol.scrollLeft = 0;
+    } else if (browserCol && (opts.preserveScroll || !opts.resetScroll)) {
+        browserCol.scrollLeft = oldScrollLeft;
+    }
 }
 
 function getFileIcon(name) {
@@ -2024,11 +3077,174 @@ function isPreviewable(name) {
     return ["png","jpg","jpeg","gif","bmp","svg","webp","pdf"].indexOf(ext) >= 0;
 }
 
+function hasUnsavedTextEdit() {
+    return S.editorMode === "text" && !!S.editingFile && !!S.editDirty;
+}
+
+function ensureUnsavedEditorModal() {
+    var el = document.getElementById("unsavedEditorModal");
+    if (el) return el;
+    el = document.createElement("div");
+    el.className = "modal fade";
+    el.id = "unsavedEditorModal";
+    el.tabIndex = -1;
+    el.innerHTML = [
+        '<div class="modal-dialog modal-dialog-centered"><div class="modal-content">',
+        '<div class="modal-header py-2"><h6 class="modal-title">存在未保存的编辑</h6></div>',
+        '<div class="modal-body">',
+        '<div class="small text-muted mb-2">当前文本文件还没有保存。</div>',
+        '<div class="font-monospace small text-break" id="unsavedEditorPath"></div>',
+        '</div>',
+        '<div class="modal-footer py-2">',
+        '<button type="button" class="btn btn-sm btn-outline-secondary" id="unsavedEditorCancel">取消</button>',
+        '<button type="button" class="btn btn-sm btn-outline-danger" id="unsavedEditorDiscard">不保存</button>',
+        '<button type="button" class="btn btn-sm btn-primary" id="unsavedEditorSave"><i class="bi bi-floppy me-1"></i>保存</button>',
+        '</div></div></div>'
+    ].join("");
+    document.body.appendChild(el);
+    return el;
+}
+
+function askUnsavedEditorChoice() {
+    return new Promise(function(resolve) {
+        var el = ensureUnsavedEditorModal();
+        var pathEl = document.getElementById("unsavedEditorPath");
+        if (pathEl) pathEl.textContent = S.editingFile || "当前文件";
+        var modal = bootstrap.Modal.getOrCreateInstance(el, {backdrop: "static", keyboard: false});
+        var done = false;
+        var finish = function(choice) {
+            if (done) return;
+            done = true;
+            el.removeEventListener("hidden.bs.modal", onHidden);
+            document.getElementById("unsavedEditorSave").onclick = null;
+            document.getElementById("unsavedEditorDiscard").onclick = null;
+            document.getElementById("unsavedEditorCancel").onclick = null;
+            modal.hide();
+            resolve(choice);
+        };
+        var onHidden = function() { finish("cancel"); };
+        document.getElementById("unsavedEditorSave").onclick = function() { finish("save"); };
+        document.getElementById("unsavedEditorDiscard").onclick = function() { finish("discard"); };
+        document.getElementById("unsavedEditorCancel").onclick = function() { finish("cancel"); };
+        el.addEventListener("hidden.bs.modal", onHidden);
+        modal.show();
+    });
+}
+
+function confirmUnsavedEditorChange() {
+    if (!hasUnsavedTextEdit()) return Promise.resolve(true);
+    return askUnsavedEditorChoice().then(function(choice) {
+        if (choice === "save") {
+            return editorSave({silent: true}).then(function(ok) {
+                if (ok) showToast("已保存", 1000);
+                return ok;
+            });
+        }
+        if (choice === "discard") {
+            S.editDirty = false;
+            return true;
+        }
+        return false;
+    });
+}
+
+function ensurePreviewContainer() {
+    var container = document.getElementById("previewContainer");
+    if (!container) {
+        var ec = document.getElementById("fileEditorCol");
+        container = document.createElement("div");
+        container.id = "previewContainer";
+        container.className = "file-preview-container";
+        if (ec) ec.appendChild(container);
+    }
+    return container;
+}
+
+function ensurePreviewZoomControls() {
+    var controls = document.getElementById("previewZoomControls");
+    if (controls) return controls;
+    var ec = document.getElementById("fileEditorCol");
+    controls = document.createElement("div");
+    controls.id = "previewZoomControls";
+    controls.className = "preview-zoom-controls d-none";
+    controls.innerHTML = [
+        '<button class="btn btn-sm btn-outline-light" id="btnPreviewZoomOut" onclick="zoomPreview(-0.1)" title="缩小"><i class="bi bi-dash-lg"></i></button>',
+        '<button class="btn btn-sm btn-outline-light" id="btnPreviewZoomIn" onclick="zoomPreview(0.1)" title="放大"><i class="bi bi-plus-lg"></i></button>'
+    ].join("");
+    if (ec) ec.appendChild(controls);
+    return controls;
+}
+
+function syncPreviewZoomControls() {
+    var visible = S.editorMode === "text" || S.previewKind === "image";
+    var controls = ensurePreviewZoomControls();
+    controls.classList.toggle("d-none", !visible);
+    var outBtn = document.getElementById("btnPreviewZoomOut");
+    var inBtn = document.getElementById("btnPreviewZoomIn");
+    if (outBtn) outBtn.disabled = S.previewZoom <= 0.5;
+    if (inBtn) inBtn.disabled = S.previewZoom >= 3;
+}
+
+function filePreviewUrl(path) {
+    return "/api/file-preview?path=" + encodeURIComponent(path);
+}
+
+function applyPreviewZoom() {
+    var zoom = Math.max(0.5, Math.min(3, Number(S.previewZoom) || 1));
+    S.previewZoom = Math.round(zoom * 100) / 100;
+    var ta = document.getElementById("editorTextarea");
+    if (ta && S.editorMode === "text") {
+        ta.style.fontSize = Math.max(10, Math.round(12 * S.previewZoom)) + "px";
+    }
+    var scaleEl = document.getElementById("previewScaleWrap");
+    if (scaleEl && S.previewKind === "image") {
+        scaleEl.style.transform = "scale(" + S.previewZoom + ")";
+    } else if (scaleEl) {
+        scaleEl.style.transform = "";
+    }
+    syncPreviewZoomControls();
+}
+
+function zoomPreview(delta) {
+    var step = (clampPreviewZoomStep(S.previewZoomStep) / 100) * (delta < 0 ? -1 : 1);
+    setPreviewZoom(S.previewZoom + step, true);
+}
+
+function setPreviewZoom(nextZoom, notify) {
+    S.previewZoom = Math.max(0.5, Math.min(3, nextZoom));
+    applyPreviewZoom();
+    if (notify) showPreviewZoomToast();
+}
+
+function showPreviewZoomToast() {
+    var pct = Math.round(S.previewZoom * 100) + "%";
+    var badge = document.getElementById("previewZoomToast");
+    if (!badge) {
+        var ec = document.getElementById("fileEditorCol");
+        badge = document.createElement("div");
+        badge.id = "previewZoomToast";
+        badge.className = "preview-zoom-toast";
+        if (ec) ec.appendChild(badge);
+    }
+    badge.textContent = pct;
+    badge.classList.add("show");
+    if (S._previewToastTimer) clearTimeout(S._previewToastTimer);
+    S._previewToastTimer = setTimeout(function() {
+        badge.classList.remove("show");
+        S._previewToastTimer = null;
+    }, 3000);
+}
+
 function viewFile(path) {
-    if (S.fileViewMode === "full") { S.fileViewMode = "split"; applyFileViewMode(); }
+    openEditorPane();
+    releasePreviewContent();
     fetch("/api/file-content?path=" + encodeURIComponent(path)).then(function(r) { return r.json(); }).then(function(d) {
         if (d.error) { alert(d.error); return; }
-        S.editingFile = d.path; S.editDirty = false;
+        S.editingFile = d.path;
+        S.editorMode = "text";
+        S.editDirty = false;
+        S.previewKind = "text";
+        S.previewZoom = 1;
         document.getElementById("editorPath").textContent = d.path;
         var ta = document.getElementById("editorTextarea");
         ta.value = d.content; ta.style.display = "block";
@@ -2041,38 +3257,49 @@ function viewFile(path) {
         };
         hideEl("editorPlaceholder"); hideEl("previewContainer");
         showEditorButtons(true);
-    }).catch(function(e) { alert("读取失败: " + e); });
+        applyPreviewZoom();
+    }).catch(function(e) { showToast("读取失败: " + e, 2000); });
 }
 
 function previewFile(path) {
-    if (S.fileViewMode === "full") { S.fileViewMode = "split"; applyFileViewMode(); }
+    openEditorPane();
+    releasePreviewContent();
+    var previewSeq = S._filePreviewSeq;
     S.editingFile = path;
+    S.editorMode = "preview";
+    S.editDirty = false;
     document.getElementById("editorPath").textContent = path;
     hideEl("editorPlaceholder");
     document.getElementById("editorTextarea").style.display = "none";
-    var container = document.getElementById("previewContainer");
-    if (!container) {
-        var ec = document.getElementById("fileEditorCol");
-        container = document.createElement("div");
-        container.id = "previewContainer";
-        container.style.cssText = "flex:1;overflow:auto;text-align:center;background:#1a1a1a;border-radius:6px;padding:10px";
-        ec.appendChild(container);
-    }
+    var container = ensurePreviewContainer();
     container.style.display = "block";
+    S.previewZoom = 1;
     var ext = (path.split(".").pop() || "").toLowerCase();
-    var url = "/api/file-download?path=" + encodeURIComponent(path);
+    var url = filePreviewUrl(path);
     if (["png","jpg","jpeg","gif","bmp","svg","webp"].indexOf(ext) >= 0) {
-        container.innerHTML = '<img src="' + url + '" style="max-width:100%;max-height:100%;object-fit:contain">';
+        S.previewKind = "image";
+        container.innerHTML = '<div id="previewScaleWrap" class="file-preview-scale-wrap file-preview-scale-wrap-image"><img id="previewImage" class="file-preview-image" src="' + escAttr(url) + '"></div>';
     } else if (ext === "pdf") {
-        container.innerHTML = '<embed src="' + url + '" type="application/pdf" width="100%" height="100%" style="min-height:500px">';
+        S.previewKind = "pdf";
+        container.innerHTML = '<div id="previewScaleWrap" class="file-preview-scale-wrap file-preview-scale-wrap-pdf"><iframe id="previewPdfFrame" class="file-preview-pdf" title="PDF preview"></iframe></div>';
+        var frame = document.getElementById("previewPdfFrame");
+        if (frame) {
+            setTimeout(function() {
+                if (previewSeq === S._filePreviewSeq && frame.isConnected) frame.src = url;
+            }, 0);
+        }
+    } else {
+        S.previewKind = null;
+        container.innerHTML = '<div class="text-muted py-3">此文件暂不支持预览</div>';
     }
     showEditorButtons(false);
+    applyPreviewZoom();
     var bd = document.getElementById("btnDownload");
     if (bd) bd.classList.remove("d-none");
 }
 
 function showEditorButtons(showEditBtns) {
-    ["btnUndo","btnRedo","btnSave"].forEach(function(id) {
+    ["btnUndo","btnRedo","btnSave","btnRunScript"].forEach(function(id) {
         var el = document.getElementById(id);
         if (el) { if (showEditBtns) el.classList.remove("d-none"); else el.classList.add("d-none"); }
     });
@@ -2084,22 +3311,80 @@ function showEditorButtons(showEditBtns) {
     // 粘贴按钮仅在有复制内容时显示
     var bp = document.getElementById("btnPaste");
     if (bp) { if (S._hasCopied && showEditBtns) bp.classList.remove("d-none"); else bp.classList.add("d-none"); }
+    syncEditorScriptRunButton();
+}
+
+function currentEditorFileExt() {
+    var path = String(S.editingFile || "");
+    return (path.split(".").pop() || "").toLowerCase();
+}
+
+function isRunableScriptFile() {
+    if (S.editorMode !== "text" || !S.editingFile) return false;
+    return ["sh", "bash", "sbatch"].indexOf(currentEditorFileExt()) >= 0;
+}
+
+function syncEditorScriptRunButton() {
+    var btn = document.getElementById("btnRunScript");
+    if (!btn) return;
+    var visible = isRunableScriptFile();
+    btn.classList.toggle("d-none", !visible);
+    if (!visible) return;
+    if (currentEditorFileExt() === "sbatch") {
+        btn.title = "提交 sbatch 脚本";
+        btn.innerHTML = '<i class="bi bi-send-fill"></i>';
+    } else {
+        btn.title = "运行 bash 脚本";
+        btn.innerHTML = '<i class="bi bi-play-fill"></i>';
+    }
 }
 
 function editorUndo() { document.getElementById("editorTextarea").focus(); document.execCommand("undo"); }
 function editorRedo() { document.getElementById("editorTextarea").focus(); document.execCommand("redo"); }
-function editorSave() {
-    if (!S.editingFile) return;
+function runEditingScript() {
+    if (!isRunableScriptFile()) {
+        showToast("当前文件不是可运行脚本", 1000);
+        return;
+    }
+    var path = S.editingFile;
+    var ext = currentEditorFileExt();
+    var proceed = function() {
+        if (ext === "sbatch") submitSbatch(path);
+        else runBash(path);
+    };
+    if (!S.editDirty) {
+        proceed();
+        return;
+    }
+    if (confirm("脚本有未保存修改，先保存再运行吗？")) {
+        editorSave({silent: true}).then(function(ok) {
+            if (ok) proceed();
+        });
+    } else {
+        proceed();
+    }
+}
+function editorSave(opts) {
+    opts = opts || {};
+    if (!S.editingFile || S.editorMode !== "text") {
+        if (!opts.silent) showToast("当前预览不可保存", 1000);
+        return Promise.resolve(false);
+    }
     var content = document.getElementById("editorTextarea").value;
-    fetch("/api/file-save", {method:"POST",headers:{"Content-Type":"application/json"},
+    return fetch("/api/file-save", {method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({path:S.editingFile,content:content})})
     .then(function(r){return r.json();}).then(function(d) {
-        if (d.error) { alert("保存失败: " + d.error); return; }
+        if (d.error) { alert("保存失败: " + d.error); return false; }
         S.editDirty = false;
         var btn = document.getElementById("btnSave");
-        btn.classList.remove("btn-outline-success"); btn.classList.add("btn-success");
-        setTimeout(function() { btn.classList.remove("btn-success"); btn.classList.add("btn-outline-success"); }, 1000);
-    }).catch(function(e) { alert("保存失败: " + e); });
+        if (btn && !opts.silent) {
+            btn.classList.remove("btn-outline-success"); btn.classList.add("btn-success");
+            setTimeout(function() { btn.classList.remove("btn-success"); btn.classList.add("btn-outline-success"); }, 1000);
+            showToast("保存成功", 1200);
+        }
+        syncEditorScriptRunButton();
+        return true;
+    }).catch(function(e) { alert("保存失败: " + e); return false; });
 }
 function downloadFile() {
     if (!S.editingFile) return;
@@ -2182,9 +3467,10 @@ function toggleBookmark(path) {
 }
 
 function toggleBookmarkView() {
+    var fromLocation = fileNavLocation();
     S.bookmarkViewActive = !S.bookmarkViewActive;
-    var btn = document.getElementById("btnBookmarks");
-    if (btn) btn.classList.toggle("active", S.bookmarkViewActive);
+    syncBookmarkButton();
+    if (!S._fileNavSuppress) pushFileNavTransition(fromLocation, fileNavLocation());
     if (S.bookmarkViewActive) {
         renderBookmarkList();
     } else {
@@ -2192,14 +3478,35 @@ function toggleBookmarkView() {
         if (S._lastFileEntries) renderFiles(S._lastFileEntries);
         else refreshFiles();
     }
+    updateFileNavButtons();
 }
 
-function renderBookmarkList() {
+function renderBookmarkList(opts) {
+    opts = opts || {};
     var tbody = document.getElementById("filesBody");
+    var browserCol = document.getElementById("fileBrowserCol");
+    var oldScrollLeft = browserCol ? browserCol.scrollLeft : 0;
+    var cols = getVisibleFileColumns();
     if (!S.bookmarks || S.bookmarks.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-3"><i class="bi bi-star me-2"></i>暂无收藏，点击文件/文件夹旁的星标添加</td></tr>';
+        renderFileTableHeader();
+        tbody.innerHTML = '<tr><td colspan="' + visibleFileColspan() + '" class="text-center text-muted py-3"><i class="bi bi-star me-2"></i>暂无收藏，点击文件/文件夹旁的星标添加</td></tr>';
         return;
     }
+    var bookmarkEntries = S.bookmarks.map(function(bm) {
+        var name = bm.split("/").pop();
+        var maybeDir = name.indexOf(".") < 0;
+        return {
+            name: name,
+            type: maybeDir ? "dir" : "file",
+            size: 0,
+            mtime: 0,
+            owner: "-",
+            perm: "-",
+            ext: maybeDir ? "文件夹" : ""
+        };
+    });
+    autoFitFileColumnWidths(bookmarkEntries, !!opts.forceAutoFit || !!opts.resetScroll);
+    renderFileTableHeader();
     var html = '';
     S.bookmarks.forEach(function(bm) {
         var name = bm.split("/").pop();
@@ -2211,45 +3518,67 @@ function renderBookmarkList() {
         var clickFn = maybeDir
             ? "exitBookmarkAndBrowse('" + escAttr(bm) + "')"
             : "exitBookmarkAndView('" + escAttr(bm) + "')";
-        html += '<tr><td><i class="bi bi-star-fill text-warning me-1"></i><i class="bi ' + icon + ' me-1"></i>';
-        html += '<a href="#" onclick="' + clickFn + ';return false">' + esc(name) + '</a>';
-        html += ' <small class="text-muted ms-2">' + esc(dir) + '</small></td>';
-        html += '<td>-</td><td>-</td>';
-        html += '<td><button class="btn btn-sm btn-outline-danger py-0" onclick="toggleBookmark(\'' + escAttr(bm) + '\')" title="取消收藏"><i class="bi bi-x-lg"></i></button></td>';
+        html += '<tr class="file-row" onclick="' + clickFn + '">';
+        cols.forEach(function(def) {
+            if (def.key === "name") {
+                html += '<td class="file-cell file-cell-name"><i class="bi bi-star-fill text-warning me-1"></i><i class="bi ' + icon + ' me-1"></i>';
+                html += '<span class="file-name-text">' + esc(name) + '</span>';
+                html += ' <small class="text-muted ms-2">' + esc(dir) + '</small></td>';
+            } else if (def.key === "ext") {
+                html += '<td class="file-cell">' + (maybeDir ? "文件夹" : esc(fileEntryTypeLabel({name:name,type:"file"}))) + '</td>';
+            } else if (def.key === "actions") {
+                html += '<td class="file-cell"><button class="btn btn-sm btn-outline-danger py-0" onclick="event.stopPropagation();toggleBookmark(\'' + escAttr(bm) + '\')" title="取消收藏"><i class="bi bi-x-lg"></i></button></td>';
+            } else {
+                html += '<td class="file-cell text-muted">-</td>';
+            }
+        });
         html += '</tr>';
     });
     tbody.innerHTML = html;
+    if (browserCol && opts.resetScroll) {
+        browserCol.scrollLeft = 0;
+    } else if (browserCol && (opts.preserveScroll || !opts.resetScroll)) {
+        browserCol.scrollLeft = oldScrollLeft;
+    }
 }
 
 /* 退出收藏视图并浏览文件夹 */
 function exitBookmarkAndBrowse(path) {
+    var fromLocation = fileNavLocation();
     S.bookmarkViewActive = false;
-    var btn = document.getElementById("btnBookmarks");
-    if (btn) btn.classList.remove("active");
-    browsePath(path);
+    syncBookmarkButton();
+    browsePath(path, {fromLocation: fromLocation});
 }
 
 /* 退出收藏视图并打开文件 */
 function exitBookmarkAndView(path) {
-    S.bookmarkViewActive = false;
-    var btn = document.getElementById("btnBookmarks");
-    if (btn) btn.classList.remove("active");
-    // 先浏览到文件所在目录
-    var dir = path.substring(0, path.lastIndexOf("/"));
-    S.filePath = dir;
-    var pi = document.getElementById("pathInput"); if (pi) pi.value = dir;
-    viewFile(path);
-    // 刷新文件列表显示该目录
-    var url = "/api/files?path=" + encodeURIComponent(dir);
-    if (S.showFolderSizes) url += "&folder_sizes=1";
-    fetch(url).then(function(r) { return r.json(); }).then(function(d) {
-        if (!d.error) {
-            S.filePath = d.path;
-            if (pi) pi.value = d.path;
-            S._lastFileEntries = d.entries || [];
-            renderFiles(d.entries || []);
-        }
-    }).catch(function() {});
+    var fromLocation = fileNavLocation();
+    confirmUnsavedEditorChange().then(function(ok) {
+        if (!ok) return;
+        S.bookmarkViewActive = false;
+        syncBookmarkButton();
+        // 先浏览到文件所在目录
+        var dir = path.substring(0, path.lastIndexOf("/"));
+        rememberFilesFilterForPath(S.filePath, S.filesFilterText);
+        S.filePath = dir;
+        var pi = document.getElementById("pathInput"); if (pi) pi.value = dir;
+        if (isPreviewable(path)) previewFile(path);
+        else viewFile(path);
+        // 刷新文件列表显示该目录
+        var url = "/api/files?path=" + encodeURIComponent(dir);
+        if (S.showFolderSizes) url += "&folder_sizes=1";
+        fetch(url).then(function(r) { return r.json(); }).then(function(d) {
+            if (!d.error) {
+                S.filePath = d.path;
+                if (pi) pi.value = d.path;
+                S._lastFileEntries = d.entries || [];
+                applyFilesFilterForPath(d.path);
+                if (!S._fileNavSuppress) pushFileNavTransition(fromLocation, {type: "path", path: d.path});
+                renderFiles(d.entries || []);
+                updateFileNavButtons();
+            }
+        }).catch(function() {});
+    });
 }
 
 function showUploadDialog() {
@@ -2298,10 +3627,86 @@ function esc(s) { return s ? String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;"
 function escAttr(s) { return s ? String(s).replace(/\\/g,"\\\\").replace(/'/g,"\'").replace(/"/g,"&quot;") : ""; }
 
 /* ===== 登录节点管理 ===== */
+var LOGIN_PROC_SORT_LABELS = {
+    cpu_pct: "CPU%",
+    rss_kb: "RAM (RSS)",
+    mem_pct: "MEM%",
+    elapsed: "运行时间",
+    pid: "PID"
+};
+
+function updateLoginNodeControls() {
+    setText("loginSortLabel", LOGIN_PROC_SORT_LABELS[S.loginProcessSort] || "CPU%");
+    setText("loginLimitLabel", "前 " + (S.loginProcessLimit || 50));
+    setText("loginCmdModeLabel", S.loginDetailedCommands ? "详细命令" : "快速命令");
+    setText("loginRootFilterLabel", S.loginExcludeRoot ? "隐藏 root" : "显示 root");
+    var btn = document.getElementById("loginCmdModeBtn");
+    if (btn) btn.classList.toggle("active", !!S.loginDetailedCommands);
+    var rootBtn = document.getElementById("loginRootFilterBtn");
+    if (rootBtn) rootBtn.classList.toggle("active", !!S.loginExcludeRoot);
+    syncLoginProcessSearchUi();
+}
+
+function syncLoginProcessSearchUi() {
+    var input = document.getElementById("loginProcessSearch");
+    if (input && input.value !== S.loginProcessSearch) input.value = S.loginProcessSearch;
+    var clearBtn = document.getElementById("btnClearLoginProcessSearch");
+    if (clearBtn) clearBtn.disabled = !S.loginProcessSearch;
+}
+
+function setLoginProcessSearch(text) {
+    S.loginProcessSearch = String(text || "").trim().toLowerCase();
+    syncLoginProcessSearchUi();
+    renderLoginNodeProcesses();
+}
+
+function clearLoginProcessSearch() {
+    S.loginProcessSearch = "";
+    syncLoginProcessSearchUi();
+    renderLoginNodeProcesses();
+}
+
+function setLoginProcSort(col) {
+    if (!LOGIN_PROC_SORT_LABELS[col]) return;
+    S.loginProcessSort = col;
+    S.loginSortCol = col;
+    S.loginSortAsc = false;
+    updateLoginNodeControls();
+    loadLoginNodeInfo();
+}
+
+function setLoginProcLimit(limit) {
+    var val = parseInt(limit, 10);
+    if (!val || val < 1) val = 50;
+    if (val > 500) val = 500;
+    S.loginProcessLimit = val;
+    updateLoginNodeControls();
+    loadLoginNodeInfo();
+}
+
+function setLoginCommandMode(detailed) {
+    S.loginDetailedCommands = !!detailed;
+    updateLoginNodeControls();
+    saveSettingsToServer({loginNodeDetailedCommands: S.loginDetailedCommands});
+    loadLoginNodeInfo();
+}
+
+function setLoginExcludeRoot(excludeRoot) {
+    S.loginExcludeRoot = !!excludeRoot;
+    updateLoginNodeControls();
+    saveSettingsToServer({loginNodeExcludeRoot: S.loginExcludeRoot});
+    loadLoginNodeInfo();
+}
+
 function loadLoginNodeInfo() {
     var tbody = document.getElementById("loginNodeProcesses");
     if (tbody) tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted py-3"><div class="spinner-border spinner-border-sm me-2"></div>加载中...</td></tr>';
-    fetch("/api/login-node/info")
+    updateLoginNodeControls();
+    var sort = encodeURIComponent(S.loginProcessSort || "cpu_pct");
+    var limit = parseInt(S.loginProcessLimit || 50, 10);
+    var detail = S.loginDetailedCommands ? 1 : 0;
+    var excludeRoot = S.loginExcludeRoot ? 1 : 0;
+    fetch("/api/login-node/info?sort=" + sort + "&limit=" + limit + "&detail=" + detail + "&exclude_root=" + excludeRoot)
         .then(function(r) {
             if (!r.ok) throw new Error("HTTP " + r.status);
             return r.json();
@@ -2317,7 +3722,11 @@ function loadLoginNodeInfo() {
             var memAvail = Number(d.mem_available || memFree || 0);
             setText("loginNodeHostname", "🖥️ " + (d.hostname || "-"));
             setText("loginNodeUptime", d.uptime || "");
-            setText("loginNodeOnline", "在线用户: " + (d.online_users || 0));
+            var procText = "进程: " + (d.process_count_total || 0);
+            if (d.exclude_root && Number(d.root_process_count || 0) > 0) {
+                procText += " / 已隐藏 root " + Number(d.root_process_count || 0);
+            }
+            setText("loginNodeOnline", "在线用户: " + (d.online_users || 0) + " | " + procText);
             setText("loginNodeLoad", load1.toFixed(2) + " / " + load5.toFixed(2) + " / " + load15.toFixed(2));
             setText("loginNodeCpus", d.cpus || "-");
             var memPct = memTotal > 0 ? Math.round(memUsed / memTotal * 100) : 0;
@@ -2325,6 +3734,10 @@ function loadLoginNodeInfo() {
             setText("loginNodeMemText", formatSizeAuto(memUsed) + " / " + formatSizeAuto(memTotal));
             setText("loginNodeMemAvail", formatSizeAuto(memAvail));
             S._loginProcs = Array.isArray(d.processes) ? d.processes : [];
+            if (LOGIN_PROC_SORT_LABELS[d.process_sort]) S.loginProcessSort = d.process_sort;
+            if (d.process_limit) S.loginProcessLimit = Number(d.process_limit) || S.loginProcessLimit;
+            if (typeof d.exclude_root === "boolean") S.loginExcludeRoot = d.exclude_root;
+            updateLoginNodeControls();
             renderLoginNodeProcesses();
         })
         .catch(function(e) {
@@ -2342,14 +3755,27 @@ function renderLoginNodeProcesses() {
     var procs = (S._loginProcs || []).slice();
     var tbody = document.getElementById("loginNodeProcesses");
     if (!tbody) return;
+    var q = S.loginProcessSearch;
+    if (q) {
+        procs = procs.filter(function(p) {
+            var pid = String(p.pid || "");
+            var user = String(p.user || "").toLowerCase();
+            var cmd = String(p.cmd || p.command || "").toLowerCase();
+            return pid.indexOf(q) >= 0 || user.indexOf(q) >= 0 || cmd.indexOf(q) >= 0;
+        });
+    }
     if (!procs.length) {
-        tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted py-3">无进程</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted py-3">' + (q ? '无匹配进程' : '无进程') + '</td></tr>';
         return;
     }
     /* 排序 */
     var col = S.loginSortCol, asc = S.loginSortAsc;
     procs.sort(function(a, b) {
         var va, vb;
+        if (col === 'elapsed') {
+            va = Number(a.elapsed_seconds) || 0; vb = Number(b.elapsed_seconds) || 0;
+            return asc ? va - vb : vb - va;
+        }
         if (col === 'pid' || col === 'cpu_pct' || col === 'mem_pct' || col === 'rss_kb') {
             va = Number(a[col]) || 0; vb = Number(b[col]) || 0;
             return asc ? va - vb : vb - va;

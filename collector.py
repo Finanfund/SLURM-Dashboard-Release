@@ -7,14 +7,18 @@ import glob
 import json
 import logging
 import os
+import pwd
 import re
 import shlex
+import stat
+import subprocess
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Any
 from collections import deque
+import config
 from config import SSH_OPTIONS, SSH_TIMEOUT, HISTORY_MAX_POINTS, CACHE_DIR, SCRIPT_DIR
 
 logger = logging.getLogger("collector")
@@ -209,19 +213,44 @@ class DataCollector:
         # 用户目录大小缓存：{path: {"usage": bytes, "ts": timestamp}}
         self._du_cache: Dict[str, dict] = {}
         self._du_computing: set = set()
+        self._cache_cleanup_future = None
+        self._last_cache_cleanup_ts: float = 0.0
+        self._archive_save_future = None
+        self._archive_save_pending: bool = False
+        self._last_archive_save_ts: float = 0.0
         # 登录节点信息短时缓存，避免频繁全量扫描 /proc 与 ps
         self._login_node_info_cache: Dict[str, Any] = {}
         self._login_node_info_cache_ts: float = 0.0
-        # 文件列表短时缓存：{path: {"entries": [...], "ts": float}}，TTL=2秒
+        self._login_node_info_cache_key: tuple = ()
+        self._login_node_snapshot_cache: Dict[tuple, Dict[str, Any]] = {}
+        self._login_node_snapshot_cache_ts: Dict[tuple, float] = {}
+        self._login_node_refresh_futures: Dict[tuple, Any] = {}
+        self._login_node_cmdline_cache: Dict[int, tuple] = {}
+        self._LOGIN_NODE_CACHE_TTL = 10.0
+        self._LOGIN_NODE_STALE_TTL = 180.0
+        self._LOGIN_NODE_INITIAL_WAIT = 8.0
+        self._LOGIN_NODE_CMDLINE_TTL = 60.0
+        # 文件列表短时缓存：降低连续点击和返回目录时的 NFS 重复扫描
         self._dir_cache: Dict[str, dict] = {}
-        self._DIR_CACHE_TTL = 2.0
+        self._DIR_CACHE_TTL = 8.0
         # IO 线程池：用于不阻塞事件循环的文件系统操作
         self._io_executor = ThreadPoolExecutor(max_workers=4)
-        # 用户设置缓存（避免每次采集都同步读 NFS）
-        self._user_settings_cache: dict = {}
+        # 用户设置缓存：事件循环只读内存，磁盘刷新在线程池中执行，避免 NFS 卡住全站
+        self._user_settings_cache: dict = dict(config.DEFAULT_USER_SETTINGS)
         self._user_settings_cache_ts: float = 0.0
-        self._USER_SETTINGS_TTL = 5.0
+        self._user_settings_refresh_future = None
+        self._USER_SETTINGS_TTL = 30.0
+        # 单飞任务句柄：避免周期任务堆叠造成抖动
+        self._task_backfill = None
+        self._task_collect_logs = None
+        self._task_collect_numa = None
+        self._task_reconcile_archived = None
+        self._task_fetch_finished_paths = None
         os.makedirs(CACHE_DIR, exist_ok=True)
+        try:
+            self.update_user_settings_cache(config.load_user_settings())
+        except Exception:
+            logger.warning("Failed to load user settings at startup; using defaults")
         self._load_cache()
         self._load_archived_jobs()
 
@@ -233,18 +262,58 @@ class DataCollector:
         self._paused = val
 
     def _load_user_settings_cached(self) -> dict:
-        """读取 user_settings.json（带 5 秒缓存，避免每次采集都同步读 NFS）"""
+        """Return cached user settings without blocking the event loop on NFS."""
         now = time.time()
+        self._consume_user_settings_refresh()
         if self._user_settings_cache and (now - self._user_settings_cache_ts) < self._USER_SETTINGS_TTL:
-            return self._user_settings_cache
+            return dict(self._user_settings_cache)
+        self._schedule_user_settings_refresh()
+        if not self._user_settings_cache:
+            self._user_settings_cache = dict(config.DEFAULT_USER_SETTINGS)
+            self._user_settings_cache_ts = now
+        return dict(self._user_settings_cache)
+
+    def update_user_settings_cache(self, settings: dict):
+        merged = dict(config.DEFAULT_USER_SETTINGS)
+        if settings:
+            merged.update(settings)
+        self._user_settings_cache = merged
+        self._user_settings_cache_ts = time.time()
+
+    def _consume_user_settings_refresh(self):
+        fut = self._user_settings_refresh_future
+        if not fut or not fut.done():
+            return
         try:
-            with open("user_settings.json", "r") as f:
-                self._user_settings_cache = json.load(f)
-                self._user_settings_cache_ts = now
-        except Exception:
-            if not self._user_settings_cache:
-                self._user_settings_cache = {}
-        return self._user_settings_cache
+            self.update_user_settings_cache(fut.result())
+        except Exception as e:
+            logger.debug(f"user settings refresh failed: {e}")
+        finally:
+            self._user_settings_refresh_future = None
+
+    def _schedule_user_settings_refresh(self):
+        fut = self._user_settings_refresh_future
+        if fut and not fut.done():
+            return
+        self._user_settings_refresh_future = self._io_executor.submit(config.load_user_settings)
+
+    def _start_singleflight_task(self, attr_name: str, coro, task_name: str):
+        """Start task only if previous one completed."""
+        running = getattr(self, attr_name, None)
+        if running and not running.done():
+            logger.debug(f"Skip {task_name}: previous task still running")
+            close = getattr(coro, "close", None)
+            if close:
+                close()
+            return None
+        task = asyncio.create_task(coro)
+        setattr(self, attr_name, task)
+
+        def _clear(_):
+            if getattr(self, attr_name, None) is task:
+                setattr(self, attr_name, None)
+        task.add_done_callback(_clear)
+        return task
 
     async def _run_cmd(self, cmd: str, timeout: int = 10) -> Optional[str]:
         try:
@@ -524,7 +593,7 @@ class DataCollector:
             self._job_history[jid].append(point)
 
     def _save_cache(self):
-        """增量保存历史数据到批次文件（NFS 写入提交到 IO 线程池）"""
+        """增量保存历史数据到批次文件（NFS 写入与清理都提交到 IO 线程池）"""
         try:
             now = time.time()
             batch_data = {"node_history": {}, "job_history": {}, "timestamp": now}
@@ -543,13 +612,63 @@ class DataCollector:
                 self._io_executor.submit(self._write_file_sync, filepath, payload)
                 logger.debug(f"Cache batch saved: {filename}")
             self._last_save_time = now
-            self._cleanup_cache_files()
+            self._schedule_cache_cleanup(now)
         except Exception as e:
             logger.warning(f"Failed to save cache: {e}")
 
+    def _schedule_cache_cleanup(self, now: Optional[float] = None):
+        """Schedule cache cleanup off the event loop; scanning .cache can be slow on NFS."""
+        now = now or time.time()
+        running = self._cache_cleanup_future and not self._cache_cleanup_future.done()
+        if running or now - self._last_cache_cleanup_ts < 300:
+            return
+        self._last_cache_cleanup_ts = now
+        self._cache_cleanup_future = self._io_executor.submit(self._cleanup_cache_files)
+
+    @staticmethod
+    def _cache_file_timestamp(name: str) -> Optional[int]:
+        try:
+            return int(name.split("_", 1)[1].split(".", 1)[0])
+        except (ValueError, IndexError):
+            return None
+
+    def _list_cache_batch_files(self) -> List[tuple]:
+        files = []
+        try:
+            with os.scandir(CACHE_DIR) as entries:
+                for entry in entries:
+                    if not entry.is_file():
+                        continue
+                    name = entry.name
+                    if not (name.startswith("cache_") and name.endswith(".json")):
+                        continue
+                    ts = self._cache_file_timestamp(name)
+                    if ts is not None:
+                        files.append((ts, entry.path))
+        except FileNotFoundError:
+            return []
+        files.sort(key=lambda item: item[0])
+        return files
+
     def _load_cache(self):
-        """启动时加载所有批次缓存文件并合并"""
-        files = sorted(glob.glob(os.path.join(CACHE_DIR, "cache_*.json")))
+        """启动时加载近期批次缓存文件并合并，旧批次保留在磁盘上。"""
+        all_files = self._list_cache_batch_files()
+        files = []
+        skipped = 0
+        if all_files:
+            load_seconds = 24 * 3600
+            try:
+                from config import load_user_settings
+                settings = load_user_settings()
+                history_min = int(settings.get("historyDurationMin", 60) or 60)
+                load_seconds = max(load_seconds, history_min * 60 + 600)
+            except Exception:
+                pass
+            cutoff = time.time() - load_seconds
+            files = [path for ts, path in all_files if ts >= cutoff]
+            if not files:
+                files = [all_files[-1][1]]
+            skipped = max(len(all_files) - len(files), 0)
         if not files:
             # 尝试加载旧版单文件缓存
             old_path = os.path.join(CACHE_DIR, "history_cache.json")
@@ -572,7 +691,8 @@ class DataCollector:
             except Exception as e:
                 logger.warning(f"Failed to load cache file {filepath}: {e}")
         if loaded > 0:
-            logger.info(f"Loaded {loaded} cache batch files")
+            suffix = f" (skipped {skipped} old batch files)" if skipped else ""
+            logger.info(f"Loaded {loaded} cache batch files{suffix}")
             self._last_save_time = time.time()
 
     def _load_archived_jobs(self):
@@ -591,14 +711,20 @@ class DataCollector:
         # 注：残留 RUNNING 状态的修正在第一次采集时异步执行（_reconcile_stale_running_archived）
         # 这样可以对比当前真正运行中的任务，避免误修正
 
-    def _save_archived_jobs(self):
-        """保存归档任务列表到磁盘"""
+    def _save_archived_jobs(self, force: bool = False):
+        """保存归档任务列表到磁盘；实际写入在线程池中执行，避免 NFS 阻塞事件循环。"""
         try:
             archive_path = os.path.join(CACHE_DIR, "archived_jobs.json")
             # 安全检查：如果内存中为空但磁盘文件有数据，不覆盖（防止丢失）
             if not self._archived_jobs:
-                if os.path.exists(archive_path) and os.path.getsize(archive_path) > 10:
-                    return
+                return
+            now = time.time()
+            if not force and now - self._last_archive_save_ts < 60:
+                self._archive_save_pending = True
+                return
+            if self._archive_save_future and not self._archive_save_future.done():
+                self._archive_save_pending = True
+                return
             data = {}
             for jid, (ji, end_t) in self._archived_jobs.items():
                 data[jid] = {
@@ -615,8 +741,15 @@ class DataCollector:
                     },
                     "end_time": end_t
                 }
-            with open(archive_path, "w") as f:
-                json.dump(data, f, ensure_ascii=False)
+            payload = json.dumps(data, ensure_ascii=False)
+            self._archive_save_pending = False
+            self._last_archive_save_ts = now
+            if force:
+                self._write_file_sync(archive_path, payload)
+                return
+            self._archive_save_future = self._io_executor.submit(
+                self._write_file_sync, archive_path, payload
+            )
         except Exception as e:
             logger.warning(f"Failed to save archived jobs: {e}")
 
@@ -641,9 +774,8 @@ class DataCollector:
         # 包含当前正在运行且被追踪的用户的任务
         if self._last_snapshot:
             try:
-                with open("user_settings.json", "r") as f:
-                    _us = json.load(f)
-                    track_users = set(u.strip() for u in _us.get("historyTrackUsers", "").split(",") if u.strip())
+                _us = self._load_user_settings_cached()
+                track_users = set(u.strip() for u in _us.get("historyTrackUsers", "").split(",") if u.strip())
             except Exception:
                 track_users = set()
             for jid, ji in self._last_snapshot.jobs.items():
@@ -887,7 +1019,11 @@ class DataCollector:
 
         # 后台任务：继续等待慢节点，完成后自动更新缓存（不阻塞当前采集）
         if pending:
-            asyncio.ensure_future(self._backfill_slow_nodes(pending, node_futures))
+            self._start_singleflight_task(
+                "_task_backfill",
+                self._backfill_slow_nodes(pending, node_futures),
+                "backfill_slow_nodes"
+            )
 
         elapsed = time.time() - t0
         parts = []
@@ -1009,8 +1145,7 @@ class DataCollector:
         query_nodes = [n for n in nodes if "down" not in nodes[n].state.lower()]
 
         # 节点记录过滤：用户设置中 record=false 的节点不进行 SSH 采集
-        from config import load_user_settings
-        _node_vis = load_user_settings().get("nodeVisibility", {})
+        _node_vis = self._load_user_settings_cached().get("nodeVisibility", {})
         if _node_vis:
             query_nodes = [n for n in query_nodes if _node_vis.get(n, {}).get("record", True)]
         rt_results = {}
@@ -1222,29 +1357,42 @@ class DataCollector:
             self._collect_count += 1
             if self._collect_count % 30 == 0:
                 self._save_cache()
+            if self._archive_save_pending:
+                self._save_archived_jobs()
 
             # 异步获取新结束任务的 stdout/stderr 路径（通过 scontrol，不阻塞主流程）
             if _newly_finished_jids:
-                asyncio.create_task(self._fetch_finished_log_paths(_newly_finished_jids))
+                self._start_singleflight_task(
+                    "_task_fetch_finished_paths",
+                    self._fetch_finished_log_paths(_newly_finished_jids),
+                    "fetch_finished_log_paths"
+                )
 
             # 异步采集追踪用户运行中作业的 stdout/stderr 输出（每3个周期执行一次，减少系统负载）
             if _cluster_user and self._collect_count % 3 == 0:
-                asyncio.create_task(self._collect_job_logs(jobs, _cluster_user))
+                self._start_singleflight_task(
+                    "_task_collect_logs",
+                    self._collect_job_logs(jobs, _cluster_user),
+                    "collect_job_logs"
+                )
 
             # 第一次采集：异步修正归档中状态残留为 RUNNING 的已结束任务
             # 注意：_collect_count 在上方已自增，第一次采集完成后为 1
             if self._collect_count == 1:
-                asyncio.create_task(self._reconcile_stale_running_archived(set(jobs.keys())))
+                self._start_singleflight_task(
+                    "_task_reconcile_archived",
+                    self._reconcile_stale_running_archived(set(jobs.keys())),
+                    "reconcile_stale_running_archived"
+                )
 
             # 异步采集 NUMA 内存分布趋势（每6个采集周期执行一次，减少 SSH 开销）
-            try:
-                with open("user_settings.json", "r") as f:
-                    _numa_settings = json.load(f)
-                    _numa_enabled = _numa_settings.get("numaTrackEnabled", False)
-            except Exception:
-                _numa_enabled = False
+            _numa_enabled = bool(_us.get("numaTrackEnabled", False))
             if _numa_enabled and _cluster_user and self._collect_count % 6 == 0:
-                asyncio.create_task(self._collect_job_numa(jobs, _cluster_user))
+                self._start_singleflight_task(
+                    "_task_collect_numa",
+                    self._collect_job_numa(jobs, _cluster_user),
+                    "collect_job_numa"
+                )
 
             return snapshot
 
@@ -1751,7 +1899,6 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
 
     async def get_disk_info(self, path: str) -> dict:
         """获取指定路径所在分区的磁盘空间信息（df即时返回，du后台缓存）"""
-        import config as _cfg
         safe_path = shlex.quote(path)
         try:
             out = await self._run_cmd(f"df -B1 {safe_path} 2>/dev/null | tail -1", timeout=5)
@@ -1763,9 +1910,9 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
                     avail = int(parts[3])
                     mount = parts[5]
                     # 用户主目录占用：使用缓存，不阻塞
-                    settings = _cfg.load_user_settings()
-                    cluster_user = settings.get("clusterUsername", "")
-                    home = ("/home/" + cluster_user) if cluster_user else os.path.expanduser("~")
+                    settings = self._load_user_settings_cached()
+                    configured_user = settings.get("clusterUsername", "").strip()
+                    home = os.path.join(config.FILE_BROWSER_ROOT, configured_user) if configured_user else config.FILE_BROWSER_ROOT
                     cached = self._du_cache.get(home)
                     user_usage = cached["usage"] if cached else -1
                     du_computing = home in self._du_computing
@@ -1795,13 +1942,143 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
         finally:
             self._du_computing.discard(path)
 
-    async def get_login_node_info(self) -> dict:
-        """获取登录节点系统信息和用户进程列表"""
+    def _normalize_login_process_options(self, sort_by: str = "cpu_pct", limit: int = 50) -> tuple:
+        sort_map = {
+            "cpu_pct": "cpu_pct",
+            "rss_kb": "rss_kb",
+            "mem_pct": "mem_pct",
+            "elapsed": "elapsed_seconds",
+            "pid": "pid",
+        }
+        sort_by = sort_by if sort_by in sort_map else "cpu_pct"
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, 500))
+        return sort_by, limit, sort_map[sort_by]
+
+    async def get_login_node_info(self, sort_by: str = "cpu_pct", limit: int = 50,
+                                  detailed_commands: Optional[bool] = None,
+                                  exclude_root: Optional[bool] = None) -> dict:
+        """获取登录节点系统信息和用户进程列表，优先返回缓存快照，慢采集在 IO 线程中执行。"""
+        sort_by, limit, sort_key = self._normalize_login_process_options(sort_by, limit)
+        if detailed_commands is None or exclude_root is None:
+            settings = self._load_user_settings_cached()
+            if detailed_commands is None:
+                detailed_commands = bool(settings.get("loginNodeDetailedCommands", False))
+            if exclude_root is None:
+                exclude_root = bool(settings.get("loginNodeExcludeRoot", True))
+        detailed_commands = bool(detailed_commands)
+        exclude_root = bool(exclude_root)
+        snapshot_key = self._login_node_snapshot_key(detailed_commands, exclude_root)
+        cache_key = (sort_by, limit, detailed_commands, exclude_root)
         now = time.time()
-        if self._login_node_info_cache and now - self._login_node_info_cache_ts < 2.0:
+
+        self._consume_login_node_refreshes()
+        if (self._login_node_info_cache and self._login_node_info_cache_key == cache_key
+                and now - self._login_node_info_cache_ts < 1.0):
             return dict(self._login_node_info_cache)
 
-        result = {
+        cached = self._login_node_snapshot_cache.get(snapshot_key)
+        cached_ts = self._login_node_snapshot_cache_ts.get(snapshot_key, 0.0)
+        if cached and now - cached_ts < self._LOGIN_NODE_CACHE_TTL:
+            result = await self._format_login_node_snapshot(
+                cached, sort_by, limit, sort_key, cached_ts,
+                stale=False, refreshing=False, detailed_commands=detailed_commands
+            )
+            self._login_node_info_cache = dict(result)
+            self._login_node_info_cache_ts = now
+            self._login_node_info_cache_key = cache_key
+            return result
+
+        fut = self._schedule_login_node_refresh(detailed_commands, exclude_root)
+        if detailed_commands and not cached:
+            fallback_key = self._login_node_snapshot_key(False, exclude_root)
+            fallback_cached = self._login_node_snapshot_cache.get(fallback_key)
+            fallback_ts = self._login_node_snapshot_cache_ts.get(fallback_key, 0.0)
+            if fallback_cached and now - fallback_ts < self._LOGIN_NODE_STALE_TTL:
+                result = await self._format_login_node_snapshot(
+                    fallback_cached, sort_by, limit, sort_key, fallback_ts,
+                    stale=True, refreshing=not fut.done(), detailed_commands=False
+                )
+                result["detail_fallback"] = True
+                self._login_node_info_cache = dict(result)
+                self._login_node_info_cache_ts = now
+                self._login_node_info_cache_key = cache_key
+                return result
+
+        if not cached:
+            try:
+                wrapped = asyncio.wrap_future(fut)
+                snapshot = await asyncio.wait_for(asyncio.shield(wrapped), timeout=self._LOGIN_NODE_INITIAL_WAIT)
+                self._store_login_node_snapshot(detailed_commands, exclude_root, snapshot)
+                cached = snapshot
+                cached_ts = self._login_node_snapshot_cache_ts.get(snapshot_key, time.time())
+            except asyncio.TimeoutError:
+                logger.warning("login-node initial collection timed out; returning empty snapshot")
+                return await self._format_login_node_snapshot(
+                    self._empty_login_node_snapshot(detailed_commands, exclude_root),
+                    sort_by, limit, sort_key, 0.0,
+                    stale=True, refreshing=True, detailed_commands=False
+                )
+            except Exception as e:
+                logger.warning(f"login-node initial collection failed: {e}")
+                return await self._format_login_node_snapshot(
+                    self._empty_login_node_snapshot(detailed_commands, exclude_root),
+                    sort_by, limit, sort_key, 0.0,
+                    stale=True, refreshing=False, detailed_commands=False
+                )
+
+        result = await self._format_login_node_snapshot(
+            cached, sort_by, limit, sort_key, cached_ts,
+            stale=True, refreshing=not fut.done(), detailed_commands=detailed_commands
+        )
+        self._login_node_info_cache = dict(result)
+        self._login_node_info_cache_ts = now
+        self._login_node_info_cache_key = cache_key
+        return result
+
+    def _consume_login_node_refreshes(self):
+        for snapshot_key, fut in list(self._login_node_refresh_futures.items()):
+            if not fut.done():
+                continue
+            try:
+                detailed_commands, exclude_root = snapshot_key
+                self._store_login_node_snapshot(detailed_commands, exclude_root, fut.result())
+            except Exception as e:
+                logger.warning(f"login-node refresh failed: {e}")
+            finally:
+                self._login_node_refresh_futures.pop(snapshot_key, None)
+
+    @staticmethod
+    def _login_node_snapshot_key(detailed_commands: bool, exclude_root: bool) -> tuple:
+        return bool(detailed_commands), bool(exclude_root)
+
+    def _schedule_login_node_refresh(self, detailed_commands: bool, exclude_root: bool):
+        snapshot_key = self._login_node_snapshot_key(detailed_commands, exclude_root)
+        fut = self._login_node_refresh_futures.get(snapshot_key)
+        if fut and not fut.done():
+            return fut
+        fut = self._io_executor.submit(
+            self._collect_login_node_snapshot_sync, detailed_commands, exclude_root
+        )
+        self._login_node_refresh_futures[snapshot_key] = fut
+        return fut
+
+    def _store_login_node_snapshot(self, detailed_commands: bool, exclude_root: bool, snapshot: dict):
+        actual_detail = bool(snapshot.get("command_detail", detailed_commands))
+        snapshot_key = self._login_node_snapshot_key(actual_detail, exclude_root)
+        self._login_node_snapshot_cache[snapshot_key] = snapshot
+        self._login_node_snapshot_cache_ts[snapshot_key] = time.time()
+        if actual_detail != detailed_commands:
+            requested_key = self._login_node_snapshot_key(detailed_commands, exclude_root)
+            self._login_node_snapshot_cache[requested_key] = snapshot
+            self._login_node_snapshot_cache_ts[requested_key] = time.time()
+
+    def _empty_login_node_snapshot(self, detailed_commands: bool = False,
+                                   exclude_root: bool = True) -> dict:
+        return {
             "hostname": "unknown",
             "load_1": 0.0,
             "load_5": 0.0,
@@ -1813,8 +2090,18 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
             "mem_available": 0,
             "uptime": "-",
             "online_users": 0,
-            "processes": [],
+            "_all_processes": [],
+            "process_count_total": 0,
+            "process_count_unfiltered": 0,
+            "root_process_count": 0,
+            "command_detail": bool(detailed_commands),
+            "detail_fallback": False,
+            "exclude_root": bool(exclude_root),
         }
+
+    def _collect_login_node_snapshot_sync(self, detailed_commands: bool = False,
+                                          exclude_root: bool = True) -> dict:
+        result = self._empty_login_node_snapshot(detailed_commands, exclude_root)
         try:
             result["hostname"] = os.uname().nodename
         except Exception:
@@ -1830,6 +2117,20 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
             result["cpus"] = os.cpu_count() or 0
         except Exception:
             pass
+        self._fill_login_node_meminfo_sync(result)
+        self._fill_login_node_uptime_sync(result)
+        result["online_users"] = self._collect_online_user_count_sync()
+        processes, root_process_count, actual_detail, fallback = self._collect_login_processes_sync(exclude_root)
+        result["_all_processes"] = processes
+        result["process_count_total"] = len(processes)
+        result["process_count_unfiltered"] = len(processes) + root_process_count if exclude_root else len(processes)
+        result["root_process_count"] = root_process_count
+        result["command_detail"] = bool(detailed_commands and actual_detail)
+        result["detail_fallback"] = fallback
+        result["exclude_root"] = bool(exclude_root)
+        return result
+
+    def _fill_login_node_meminfo_sync(self, result: dict):
         try:
             meminfo = {}
             with open("/proc/meminfo", "r", encoding="utf-8", errors="replace") as f:
@@ -1850,6 +2151,8 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
             result["mem_available"] = mem_available
         except Exception:
             pass
+
+    def _fill_login_node_uptime_sync(self, result: dict):
         try:
             with open("/proc/uptime", "r", encoding="utf-8", errors="replace") as f:
                 uptime_sec = int(float(f.read().split()[0]))
@@ -1866,41 +2169,182 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
             result["uptime"] = " ".join(parts)
         except Exception:
             pass
-        try:
-            who_out = await self._run_cmd("who | wc -l", timeout=2)
-            result["online_users"] = int(who_out.strip()) if who_out and who_out.strip().isdigit() else 0
-        except Exception:
-            pass
-        try:
-            ps_out = await self._run_cmd(
-                "ps -eo user,pid,stat,etime,%cpu,%mem,rss,cmd --no-headers --sort=-%cpu 2>/dev/null | head -50",
-                timeout=3
-            )
-            processes = []
-            if ps_out:
-                for line in ps_out.strip().split("\n"):
-                    parts = line.split(None, 7)
-                    if len(parts) >= 8:
-                        try:
-                            processes.append({
-                                "user": parts[0],
-                                "pid": int(parts[1]),
-                                "state": parts[2],
-                                "elapsed": parts[3],
-                                "cpu_pct": float(parts[4]),
-                                "mem_pct": float(parts[5]),
-                                "rss_kb": int(parts[6]),
-                                "cmd": parts[7]
-                            })
-                        except (ValueError, IndexError):
-                            continue
-            result["processes"] = processes
-        except Exception:
-            pass
 
-        self._login_node_info_cache = dict(result)
-        self._login_node_info_cache_ts = now
+    def _collect_online_user_count_sync(self) -> int:
+        try:
+            out = subprocess.check_output(
+                ["who"],
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                text=True,
+                errors="replace",
+            )
+            return sum(1 for line in out.splitlines() if line.strip())
+        except Exception:
+            return 0
+
+    def _collect_login_processes_sync(self, exclude_root: bool = True) -> tuple:
+        try:
+            stdout = self._collect_login_process_output_sync()
+            processes, root_process_count = self._parse_login_process_output(stdout, exclude_root)
+            return processes, root_process_count, False, False
+        except subprocess.TimeoutExpired:
+            logger.warning("Command timeout: ps login-node process list")
+            return [], 0, False, False
+        except Exception as e:
+            logger.warning(f"ps login-node process list failed: {e}")
+            return [], 0, False, False
+
+    def _collect_login_process_output_sync(self) -> str:
+        return subprocess.check_output(
+            ["ps", "-eo", "user:32,pid,stat,etime,etimes,pcpu,pmem,rss,comm", "--no-headers"],
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+            text=True,
+            errors="replace",
+        )
+
+    def _parse_login_process_output(self, stdout: str, exclude_root: bool = True) -> tuple:
+        processes = []
+        root_process_count = 0
+        for line in stdout.splitlines():
+            parts = line.split(None, 8)
+            if len(parts) < 9:
+                continue
+            user = parts[0]
+            if user == "root":
+                root_process_count += 1
+                if exclude_root:
+                    continue
+            try:
+                processes.append({
+                    "user": user,
+                    "pid": int(parts[1]),
+                    "state": parts[2],
+                    "elapsed": parts[3],
+                    "elapsed_seconds": int(parts[4]),
+                    "cpu_pct": float(parts[5]),
+                    "mem_pct": float(parts[6]),
+                    "rss_kb": int(parts[7]),
+                    "cmd": parts[8] or "-",
+                })
+            except (ValueError, IndexError):
+                continue
+        return processes, root_process_count
+
+    async def _format_login_node_snapshot(self, snapshot: dict, sort_by: str, limit: int,
+                                          sort_key: str, cached_ts: float, stale: bool,
+                                          refreshing: bool, detailed_commands: bool) -> dict:
+        result = {k: v for k, v in snapshot.items() if k != "_all_processes"}
+        processes = list(snapshot.get("_all_processes", []))
+        processes.sort(key=lambda p: (p.get(sort_key, 0), p.get("pid", 0)), reverse=True)
+        selected = [dict(p) for p in processes[:limit]]
+        if detailed_commands and selected:
+            selected, detail_fallback = await self._enrich_login_process_cmdlines(selected)
+            result["command_detail"] = True
+            result["detail_fallback"] = detail_fallback
+        else:
+            result["command_detail"] = False
+            result["detail_fallback"] = False
+        result["processes"] = selected
+        result["process_sort"] = sort_by
+        result["process_limit"] = limit
+        result["cache_age_sec"] = round(max(time.time() - cached_ts, 0), 2) if cached_ts else None
+        result["stale"] = bool(stale)
+        result["refreshing"] = bool(refreshing)
         return result
+
+    async def _enrich_login_process_cmdlines(self, selected: List[dict]) -> tuple:
+        now = time.time()
+        to_read = []
+        skipped = False
+        for idx, proc_info in enumerate(selected):
+            pid = proc_info.get("pid")
+            if not isinstance(pid, int):
+                continue
+            if self._should_skip_login_cmdline_detail(proc_info):
+                skipped = True
+                continue
+            cached = self._login_node_cmdline_cache.get(pid)
+            if cached and now - cached[1] < self._LOGIN_NODE_CMDLINE_TTL:
+                proc_info["cmd"] = cached[0]
+                continue
+            to_read.append((idx, pid, proc_info.get("cmd", "-")))
+        if not to_read:
+            return selected, skipped
+
+        loop = asyncio.get_event_loop()
+        try:
+            batch_cmds = await asyncio.wait_for(
+                loop.run_in_executor(
+                    self._io_executor,
+                    self._read_process_cmdlines_batch,
+                    [pid for _, pid, _ in to_read],
+                ),
+                timeout=4,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("login-node detailed command enrichment timed out")
+            return selected, True
+
+        fallback_used = False
+        for idx, pid, fallback in to_read:
+            cmd = batch_cmds.get(pid)
+            if not cmd:
+                cmd = fallback
+                fallback_used = True
+            selected[idx]["cmd"] = cmd
+            if pid in batch_cmds:
+                self._login_node_cmdline_cache[pid] = (cmd, now)
+        if len(self._login_node_cmdline_cache) > 2000:
+            cutoff = now - self._LOGIN_NODE_CMDLINE_TTL
+            for pid, (_, ts) in list(self._login_node_cmdline_cache.items()):
+                if ts < cutoff:
+                    self._login_node_cmdline_cache.pop(pid, None)
+        return selected, fallback_used or skipped
+
+    @staticmethod
+    def _should_skip_login_cmdline_detail(proc_info: dict) -> bool:
+        user = str(proc_info.get("user") or "")
+        cmd = str(proc_info.get("cmd") or "")
+        system_users = {
+            "root", "slurm", "mysql", "ldap", "influxdb", "nslcd", "icinga",
+            "confluent", "polkitd", "dbus", "rpc", "chrony", "ntp",
+        }
+        system_commands = {
+            "influxd", "mysqld", "slapd", "slurmctld", "slurmd", "nslcd",
+            "icinga2", "confluent",
+        }
+        return user in system_users or cmd in system_commands
+
+    def _read_process_cmdlines_batch(self, pids: List[int]) -> Dict[int, str]:
+        if not pids:
+            return {}
+        result: Dict[int, str] = {}
+        unique_pids = [pid for pid in dict.fromkeys(pids) if isinstance(pid, int) and pid > 0]
+        if not unique_pids:
+            return result
+        for pid in unique_pids:
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    raw = f.read(8192)
+                cmd = raw.replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+                if cmd:
+                    result[pid] = cmd
+            except Exception as e:
+                logger.debug(f"login-node cmdline read failed for pid {pid}: {e}")
+        return result
+
+    def _read_process_cmdline(self, pid: int, fallback: str) -> str:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read(8192)
+            cmd = raw.replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+            if cmd:
+                return cmd
+        except Exception:
+            pass
+        return fallback or "-"
 
     async def kill_process(self, pid: int) -> dict:
         """终止登录节点上的指定进程（仅限当前用户的进程）"""
@@ -1917,7 +2361,7 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
 
     async def list_directory(self, path: str, compute_dir_sizes: bool = False) -> List[dict]:
         """列出目录内容（带 TTL 缓存 + 线程池非阻塞 IO）"""
-        # ── TTL 缓存：相同目录 2 秒内直接返回 ──
+        # ── TTL 缓存：相同目录短时间内直接返回 ──
         cache_key = f"{path}|{compute_dir_sizes}"
         cached = self._dir_cache.get(cache_key)
         if cached and (time.time() - cached["ts"]) < self._DIR_CACHE_TTL:
@@ -1952,6 +2396,77 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
 
         return entries
 
+    def invalidate_directory_cache(self, path: str = ""):
+        """清理文件浏览目录缓存；写操作后调用，避免短 TTL 内看到旧列表。"""
+        if not path:
+            self._dir_cache.clear()
+            return
+        norm = os.path.abspath(path)
+        for key in list(self._dir_cache.keys()):
+            cached_path = key.split("|", 1)[0]
+            try:
+                cached_norm = os.path.abspath(cached_path)
+            except Exception:
+                cached_norm = cached_path
+            if cached_norm == norm or cached_norm.startswith(norm + os.sep) or norm.startswith(cached_norm + os.sep):
+                del self._dir_cache[key]
+
+    async def list_directory_tree(self, path: str, limit: int = 500) -> dict:
+        """列出目录树节点的子目录（只读，供左侧树使用）。"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._io_executor, self._list_directory_tree_sync, path, limit
+        )
+
+    def _list_directory_tree_sync(self, path: str, limit: int = 500) -> dict:
+        entries = []
+        truncated = False
+        try:
+            with os.scandir(path) as it:
+                dirs = []
+                for de in it:
+                    try:
+                        if not de.is_dir(follow_symlinks=False):
+                            continue
+                        st = de.stat(follow_symlinks=False)
+                        dirs.append({
+                            "name": de.name,
+                            "path": de.path,
+                            "type": "dir",
+                            "size": st.st_size,
+                            "mtime": st.st_mtime,
+                            "owner": self._owner_name(st.st_uid),
+                            "perm": stat.filemode(st.st_mode)[1:],
+                            "ext": "文件夹",
+                            "can_read": os.access(de.path, os.R_OK | os.X_OK),
+                        })
+                    except OSError:
+                        continue
+                dirs.sort(key=lambda e: e["name"].lower())
+                if len(dirs) > limit:
+                    dirs = dirs[:limit]
+                    truncated = True
+                entries = dirs
+        except OSError as e:
+            return {"path": path, "entries": [], "error": str(e), "truncated": False}
+        return {"path": path, "entries": entries, "truncated": truncated}
+
+    @staticmethod
+    def _owner_name(uid: int) -> str:
+        try:
+            return pwd.getpwuid(uid).pw_name
+        except KeyError:
+            return str(uid)
+
+    @staticmethod
+    def _file_ext(name: str, is_dir: bool) -> str:
+        if is_dir:
+            return "文件夹"
+        base = os.path.basename(name)
+        if "." not in base or base.startswith(".") and base.count(".") == 1:
+            return ""
+        return base.rsplit(".", 1)[-1].lower()
+
     def _list_directory_sync(self, path: str) -> List[dict]:
         """同步扫描目录（在线程池中调用，用 os.scandir 减少系统调用）"""
         entries = []
@@ -1960,11 +2475,15 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
                 for de in sorted(it, key=lambda x: x.name):
                     try:
                         st = de.stat()
+                        is_dir = de.is_dir()
                         entries.append({
                             "name": de.name,
-                            "type": "dir" if de.is_dir() else "file",
+                            "type": "dir" if is_dir else "file",
                             "size": st.st_size,
                             "mtime": st.st_mtime,
+                            "owner": self._owner_name(st.st_uid),
+                            "perm": stat.filemode(st.st_mode)[1:],
+                            "ext": self._file_ext(de.name, is_dir),
                             "_full": de.path,
                         })
                     except OSError:
@@ -2088,8 +2607,7 @@ cat /sys/fs/cgroup/memory/slurm_$(hostname -s)/uid_*/job_{job_id}/memory.usage_i
         return {"success": True, "message": out.strip() if out.strip() else "脚本执行完毕（无输出）"}
 
     def snapshot_to_dict(self, snap: ClusterSnapshot) -> dict:
-        from config import load_user_settings
-        _node_vis = load_user_settings().get("nodeVisibility", {})
+        _node_vis = self._load_user_settings_cached().get("nodeVisibility", {})
 
         nodes_list = []
         for n in snap.nodes.values():

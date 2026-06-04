@@ -2,8 +2,7 @@
 """
 SLURM Dashboard — Launcher
 Usage:
-    python start.py              # Start in background on default port (8089)
-    python start.py --port 9090  # Use custom port
+    DASHBOARD_PASSWORD=... python start.py --port 9000
     python start.py --fg         # Run in foreground (for debugging)
 """
 import argparse
@@ -20,9 +19,10 @@ CACHE_DIR = os.path.join(SCRIPT_DIR, ".cache")
 
 def find_python():
     """Find the correct Python with FastAPI installed."""
-    for p in [sys.executable, os.path.expanduser("~/.conda/bin/python"), "python3", "python"]:
+    candidates = [os.getenv("DASHBOARD_PYTHON"), sys.executable, "python3", "python"]
+    for p in [x for x in candidates if x]:
         try:
-            out = subprocess.check_output([p, "-c", "import fastapi; print('ok')"],
+            out = subprocess.check_output([p, "-c", "import fastapi, multipart; print('ok')"],
                                           stderr=subprocess.DEVNULL).decode().strip()
             if out == "ok":
                 return p
@@ -52,10 +52,17 @@ def clear_cache():
 
 def main():
     parser = argparse.ArgumentParser(description="SLURM Dashboard Launcher")
-    parser.add_argument("--port", type=int, default=8089, help="Server port (default: 8089)")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=None, help="Server port (or DASHBOARD_PORT)")
+    parser.add_argument("--host", default=os.getenv("DASHBOARD_HOST", "127.0.0.1"), help="Bind host")
+    parser.add_argument("--password", default=os.getenv("DASHBOARD_PASSWORD", ""), help="Access password")
     parser.add_argument("--fg", action="store_true", help="Run in foreground")
     args = parser.parse_args()
+    if args.port is None and os.getenv("DASHBOARD_PORT"):
+        args.port = int(os.getenv("DASHBOARD_PORT"))
+    if args.port is None:
+        parser.error("--port is required unless DASHBOARD_PORT is set")
+    if not args.password:
+        parser.error("--password is required unless DASHBOARD_PASSWORD is set")
 
     running, pid = is_running()
     if running:
@@ -83,6 +90,9 @@ def main():
         print(f"\033[36m{'='*60}\033[0m")
         print(f"  Press Ctrl+C to stop.\n")
         os.chdir(SCRIPT_DIR)
+        os.environ["DASHBOARD_PASSWORD"] = args.password
+        os.environ["DASHBOARD_PORT"] = str(args.port)
+        os.environ["DASHBOARD_HOST"] = args.host
         os.execv(python, [python, os.path.join(SCRIPT_DIR, "app.py"),
                           "--host", args.host, "--port", str(args.port)])
     else:
@@ -93,6 +103,8 @@ def main():
              "--host", args.host, "--port", str(args.port)],
             cwd=SCRIPT_DIR,
             stdout=log_f, stderr=log_f,
+            env={**os.environ, "DASHBOARD_PASSWORD": args.password,
+                 "DASHBOARD_PORT": str(args.port), "DASHBOARD_HOST": args.host},
             start_new_session=True  # detach from terminal
         )
         with open(PID_FILE, "w") as f:

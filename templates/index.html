@@ -6,15 +6,22 @@
 <title>{{ cluster_name }} - Dashboard</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
-<link href="/static/css/style.css?v=25" rel="stylesheet">
+<link href="/static/css/style.css?v=34" rel="stylesheet">
 </head>
 <body>
 
 <!-- Navbar -->
 <nav class="navbar navbar-dark bg-dark border-bottom border-secondary sticky-top py-1">
- <div class="container-fluid">
-  <span class="navbar-brand mb-0 h1 py-0"><i class="bi bi-cpu"></i> {{ cluster_name }}</span>
-  <div class="d-flex align-items-center gap-2">
+ <div class="container-fluid align-items-center gap-2">
+  <span class="navbar-brand mb-0 h1 py-0 flex-shrink-0"><i class="bi bi-cpu"></i> <span class="brand-text">{{ cluster_name }}</span></span>
+  <ul class="nav nav-tabs nav-tabs-main flex-nowrap" id="mainTabs">
+   <li class="nav-item"><a class="nav-link active" data-bs-toggle="tab" href="#tabCluster" data-tab="cluster">集群状态</a></li>
+   <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabJobs" data-tab="jobs">任务列表</a></li>
+   <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabHistory" data-tab="history">历史任务</a></li>
+   <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabFiles" data-tab="files">文件浏览</a></li>
+   <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabLoginNode" data-tab="loginnode">登录节点</a></li>
+  </ul>
+  <div class="navbar-tools d-flex align-items-center gap-2 ms-auto">
    <div class="btn-group btn-group-sm">
     <button class="btn btn-outline-warning" onclick="togglePause()" id="btnPause" title="暂停/继续"><i class="bi bi-pause-fill"></i></button>
     <button class="btn btn-outline-danger" onclick="stopServer()" title="停止服务器"><i class="bi bi-stop-fill"></i></button>
@@ -43,14 +50,6 @@
 <!-- Main Container -->
 <div class="container-fluid mt-1 main-container">
 
- <!-- Tabs -->
- <ul class="nav nav-tabs" id="mainTabs">
-  <li class="nav-item"><a class="nav-link active" data-bs-toggle="tab" href="#tabCluster" data-tab="cluster">集群状态</a></li>
-  <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabJobs" data-tab="jobs">任务列表</a></li>
-  <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabHistory" data-tab="history">历史任务</a></li>
-  <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabFiles" data-tab="files">文件浏览</a></li>
-  <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabLoginNode" data-tab="loginnode">登录节点</a></li>
- </ul>
  <div class="tab-content mt-1">
 
   <!-- Tab: Cluster -->
@@ -127,33 +126,46 @@
   <!-- Tab: Files -->
   <div class="tab-pane fade" id="tabFiles">
    <div class="tab-toolbar">
-    <div class="d-flex gap-1 mb-1 align-items-center">
-      <button class="btn btn-sm btn-outline-light" onclick="browseParent()" title="上一级"><i class="bi bi-arrow-up"></i></button>
-      <button class="btn btn-sm btn-outline-light" onclick="browseHome()" title="回到主目录"><i class="bi bi-house-fill"></i></button>
-      <div class="flex-grow-1"></div>
-      <span class="small text-muted text-nowrap" id="diskInfoText" title="当前分区磁盘空间"></span>
-    </div>
     <div class="mb-1">
       <input type="text" class="form-control form-control-sm" id="pathInput" onkeypress="if(event.key==='Enter')browsePath(this.value)">
     </div>
     <div class="d-flex gap-1 mb-1 align-items-center flex-wrap">
+      <button class="btn btn-sm btn-outline-light" onclick="browseParent()" title="上一级"><i class="bi bi-arrow-up"></i></button>
+      <button class="btn btn-sm btn-outline-light" id="btnFileBack" onclick="goFileBack()" title="后退" disabled><i class="bi bi-arrow-left"></i></button>
+      <button class="btn btn-sm btn-outline-light" id="btnFileForward" onclick="goFileForward()" title="前进" disabled><i class="bi bi-arrow-right"></i></button>
+      <button class="btn btn-sm btn-outline-light" onclick="browseHome()" title="回到主目录"><i class="bi bi-house-fill"></i></button>
       <button class="btn btn-sm btn-outline-info" onclick="refreshFiles()" title="刷新"><i class="bi bi-arrow-clockwise"></i></button>
-      <button class="btn btn-sm btn-outline-success" onclick="showUploadDialog()" title="上传"><i class="bi bi-upload"></i></button>
-      <button class="btn btn-sm btn-outline-primary" onclick="createFolder()" title="新建文件夹"><i class="bi bi-folder-plus"></i></button>
-      <button class="btn btn-sm btn-outline-secondary" id="btnFolderSizes" onclick="toggleFolderSizes()" title="显示文件夹大小"><i class="bi bi-pie-chart"></i> 大小</button>
-      <button class="btn btn-sm btn-outline-warning" id="btnBookmarks" onclick="toggleBookmarkView()" title="收藏夹"><i class="bi bi-star"></i> 收藏</button>
+      <button class="btn btn-sm btn-outline-success" id="btnUploadFile" onclick="showUploadDialog()" title="上传"><i class="bi bi-upload"></i></button>
+      <button class="btn btn-sm btn-outline-primary" id="btnCreateFolder" onclick="createFolder()" title="新建文件夹"><i class="bi bi-folder-plus"></i></button>
+      <button class="btn btn-sm btn-outline-secondary" id="btnFolderSizes" onclick="toggleFolderSizes()" title="显示文件夹大小"><i class="bi bi-pie-chart"></i></button>
+      <button class="btn btn-sm btn-outline-warning" id="btnBookmarks" onclick="toggleBookmarkView()" title="收藏夹"><i class="bi bi-star"></i></button>
+      <button class="btn btn-sm btn-outline-light" id="btnFileSidebar" onclick="toggleFileSidebar()" title="显示目录树侧栏"><i class="bi bi-layout-sidebar-inset"></i></button>
+      <button class="btn btn-sm btn-outline-light active" id="btnShowHiddenFiles" onclick="toggleHiddenFiles()" title="显示隐藏文件"><i class="bi bi-eye"></i></button>
+      <div class="input-group input-group-sm" style="max-width:260px">
+        <span class="input-group-text"><i class="bi bi-funnel"></i></span>
+        <input type="text" class="form-control" id="filesFilterInput" placeholder="筛选当前目录文件名">
+        <button class="btn btn-outline-secondary" id="btnClearFilesFilter" type="button" onclick="clearFilesFilter()" title="清空筛选"><i class="bi bi-x-circle"></i></button>
+      </div>
+      <div class="flex-grow-1"></div>
+      <span class="small text-muted text-nowrap" id="diskInfoText" title="当前分区磁盘空间"></span>
     </div>
    </div>
    <div class="d-flex tab-scroll-area" id="fileRow">
+    <div class="d-none" id="fileTreeCol">
+     <div class="file-tree-header">
+      <span class="file-tree-title"><i class="bi bi-diagram-3 me-1"></i>目录树</span>
+      <span class="file-tree-tools">
+       <button class="file-tree-tool-btn" onclick="collapseDeepestFileTreeLevel()" title="折叠当前最深一级"><i class="bi bi-chevron-double-up"></i></button>
+       <button class="file-tree-tool-btn" onclick="collapseFileTreeToCurrentLevel()" title="折叠到当前目录层级"><i class="bi bi-bullseye"></i></button>
+      </span>
+     </div>
+     <div id="fileTreeBody" class="file-tree-body"></div>
+    </div>
+    <div class="file-tree-splitter d-none" id="fileTreeSplitter"></div>
     <div id="fileBrowserCol" style="min-width:200px;overflow-y:auto">
-     <div class="table-responsive">
-      <table class="table table-sm table-hover">
-       <thead><tr>
-        <th class="sortable" onclick="sortFiles('name')">名称 <i class="bi bi-chevron-expand"></i></th>
-        <th class="sortable" onclick="sortFiles('size')">大小 <i class="bi bi-chevron-expand"></i></th>
-        <th class="sortable" onclick="sortFiles('mtime')">修改时间 <i class="bi bi-chevron-expand"></i></th>
-        <th>操作</th>
-       </tr></thead>
+     <div class="table-responsive file-table-responsive">
+      <table class="table table-sm table-hover file-table" id="fileTable">
+       <thead id="fileTableHead"></thead>
        <tbody id="filesBody"></tbody>
       </table>
      </div>
@@ -169,7 +181,8 @@
        <button class="btn btn-sm btn-outline-secondary d-none" id="btnPaste" onclick="editorPaste()" title="粘贴"><i class="bi bi-clipboard-check"></i></button>
        <button class="btn btn-sm btn-outline-secondary d-none" id="btnUndo" onclick="editorUndo()"><i class="bi bi-arrow-counterclockwise"></i></button>
        <button class="btn btn-sm btn-outline-secondary d-none" id="btnRedo" onclick="editorRedo()"><i class="bi bi-arrow-clockwise"></i></button>
-       <button class="btn btn-sm btn-outline-success d-none" id="btnSave" onclick="editorSave()"><i class="bi bi-floppy"></i> 保存</button>
+       <button class="btn btn-sm btn-outline-success d-none" id="btnSave" onclick="editorSave()" title="保存"><i class="bi bi-floppy"></i></button>
+       <button class="btn btn-sm btn-outline-warning d-none" id="btnRunScript" onclick="runEditingScript()" title="运行脚本"><i class="bi bi-play-fill"></i></button>
        <button class="btn btn-sm btn-outline-info d-none" id="btnDownload" onclick="downloadFile()"><i class="bi bi-download"></i></button>
        <button class="btn btn-sm btn-outline-light" id="btnFullscreen" onclick="fullscreenEditor()" title="全屏编辑"><i class="bi bi-arrows-fullscreen"></i></button>
        <button class="btn btn-sm btn-outline-secondary" id="btnCloseEditor" onclick="closeEditor()" title="关闭预览"><i class="bi bi-x-lg"></i></button>
@@ -179,6 +192,7 @@
      <div id="editorPlaceholder" class="flex-grow-1"></div>
     </div>
    </div>
+   <div class="file-column-menu d-none" id="fileColumnMenu"></div>
    <!-- Upload Modal -->
    <div class="modal fade" id="uploadModal" tabindex="-1">
     <div class="modal-dialog"><div class="modal-content">
@@ -202,8 +216,54 @@
   <!-- Tab: Login Node -->
   <div class="tab-pane fade" id="tabLoginNode">
    <div class="tab-toolbar">
-    <div class="d-flex gap-2 align-items-center mb-1">
+    <div class="d-flex gap-2 align-items-center mb-1 flex-wrap">
      <button class="btn btn-sm btn-outline-info" onclick="loadLoginNodeInfo()" title="刷新"><i class="bi bi-arrow-clockwise me-1"></i>刷新</button>
+     <div class="input-group input-group-sm" style="max-width:280px;min-width:220px">
+      <span class="input-group-text"><i class="bi bi-search"></i></span>
+      <input type="text" class="form-control" id="loginProcessSearch" placeholder="搜索 PID / 用户 / 命令">
+      <button class="btn btn-outline-secondary" id="btnClearLoginProcessSearch" type="button" onclick="clearLoginProcessSearch()" title="清空搜索"><i class="bi bi-x-circle"></i></button>
+     </div>
+     <div class="dropdown">
+      <button class="btn btn-sm btn-outline-light dropdown-toggle" type="button" data-bs-toggle="dropdown" title="选择登录节点进程排序依据">
+       <i class="bi bi-funnel me-1"></i><span id="loginSortLabel">CPU%</span>
+      </button>
+      <ul class="dropdown-menu">
+       <li><button class="dropdown-item" type="button" onclick="setLoginProcSort('cpu_pct')">CPU%</button></li>
+       <li><button class="dropdown-item" type="button" onclick="setLoginProcSort('rss_kb')">RAM (RSS)</button></li>
+       <li><button class="dropdown-item" type="button" onclick="setLoginProcSort('mem_pct')">MEM%</button></li>
+       <li><button class="dropdown-item" type="button" onclick="setLoginProcSort('elapsed')">运行时间</button></li>
+       <li><button class="dropdown-item" type="button" onclick="setLoginProcSort('pid')">PID</button></li>
+      </ul>
+     </div>
+     <div class="dropdown">
+      <button class="btn btn-sm btn-outline-light dropdown-toggle" type="button" data-bs-toggle="dropdown" title="选择显示多少个登录节点进程">
+       <i class="bi bi-list-ol me-1"></i><span id="loginLimitLabel">前 50</span>
+      </button>
+      <ul class="dropdown-menu">
+       <li><button class="dropdown-item" type="button" onclick="setLoginProcLimit(50)">前 50</button></li>
+       <li><button class="dropdown-item" type="button" onclick="setLoginProcLimit(100)">前 100</button></li>
+       <li><button class="dropdown-item" type="button" onclick="setLoginProcLimit(200)">前 200</button></li>
+       <li><button class="dropdown-item" type="button" onclick="setLoginProcLimit(500)">前 500</button></li>
+      </ul>
+     </div>
+     <div class="dropdown">
+      <button class="btn btn-sm btn-outline-light dropdown-toggle" id="loginCmdModeBtn" type="button" data-bs-toggle="dropdown" title="选择登录节点命令显示模式">
+       <i class="bi bi-terminal me-1"></i><span id="loginCmdModeLabel">快速命令</span>
+      </button>
+      <ul class="dropdown-menu">
+       <li><button class="dropdown-item" type="button" onclick="setLoginCommandMode(false)">快速命令</button></li>
+       <li><button class="dropdown-item" type="button" onclick="setLoginCommandMode(true)">详细命令</button></li>
+      </ul>
+     </div>
+     <div class="dropdown">
+      <button class="btn btn-sm btn-outline-light dropdown-toggle" id="loginRootFilterBtn" type="button" data-bs-toggle="dropdown" title="是否在登录节点进程表中隐藏 root 用户">
+       <i class="bi bi-person-x me-1"></i><span id="loginRootFilterLabel">隐藏 root</span>
+      </button>
+      <ul class="dropdown-menu">
+       <li><button class="dropdown-item" type="button" onclick="setLoginExcludeRoot(true)">隐藏 root</button></li>
+       <li><button class="dropdown-item" type="button" onclick="setLoginExcludeRoot(false)">显示 root</button></li>
+      </ul>
+     </div>
      <span class="small text-muted" id="loginNodeHostname"></span>
      <span class="small text-muted" id="loginNodeUptime"></span>
      <div class="flex-grow-1"></div>
@@ -328,7 +388,7 @@
    </div>
    <div class="mb-3">
     <label class="form-label"><i class="bi bi-terminal me-1"></i>本机集群用户名（实时日志采集）</label>
-    <input type="text" class="form-control" id="settClusterUsername" value="" placeholder="your-username">
+    <input type="text" class="form-control" id="settClusterUsername" value="" placeholder="cluster_user">
     <div class="form-text">当前用户在集群上的用户名，系统会周期性采集此用户运行中任务的 stdout/stderr 输出并在任务详情中自动刷新</div>
    </div>
    <div class="mb-3">
@@ -338,7 +398,27 @@
     </div>
     <div class="form-text">启用后，系统会周期性采集追踪用户运行中任务的 NUMA 内存分布（本地/远程），并在任务详情的内存图表中显示堆叠趋势</div>
    </div>
-   <hr>
+	   <div class="mb-3">
+	    <div class="form-check form-switch">
+	     <input class="form-check-input" type="checkbox" id="settLoginDetailedCommands">
+	     <label class="form-check-label" for="settLoginDetailedCommands"><i class="bi bi-terminal me-1"></i>登录节点显示详细命令</label>
+	    </div>
+	   </div>
+	   <div class="mb-3">
+	    <div class="form-check form-switch">
+	     <input class="form-check-input" type="checkbox" id="settLoginExcludeRoot">
+	     <label class="form-check-label" for="settLoginExcludeRoot"><i class="bi bi-person-x me-1"></i>登录节点默认隐藏 root 用户进程</label>
+	    </div>
+	   </div>
+	   <div class="mb-3">
+	    <label class="form-label"><i class="bi bi-zoom-in me-1"></i>文件预览缩放步进</label>
+	    <div class="input-group">
+	     <input type="number" class="form-control" id="settPreviewZoomStep" min="1" max="50" value="10">
+	     <span class="input-group-text">%</span>
+	    </div>
+	    <div class="form-text">点击预览区加号/减号时每次变化的比例 (1-50)</div>
+	   </div>
+	   <hr>
    <div class="mb-3">
     <label class="form-label"><i class="bi bi-hdd-rack me-1"></i>节点显示与记录</label>
     <div class="form-text mb-2">控制哪些节点在集群视图中显示以及是否记录其历史数据。取消记录可降低采集延迟。</div>
@@ -366,6 +446,7 @@
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
-<script src="/static/js/app.js?v=25"></script>
+<script>window.FILE_BROWSER_ROOT = {{ file_browser_root | tojson }};</script>
+<script src="/static/js/app.js?v=44"></script>
 </body>
 </html>
